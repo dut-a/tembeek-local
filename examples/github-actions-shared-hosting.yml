@@ -1,0 +1,19 @@
+name: PHP readiness
+on: [push, pull_request]
+
+jobs:
+  readiness:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tembeek-local
+        run: |
+          chmod +x tools/tembeek-local/bin/tembeek-local
+          sudo ln -sf "$PWD/tools/tembeek-local/bin/tembeek-local" /usr/local/bin/tembeek-local
+
+      - name: Register project
+        run: tembeek-local init "$PWD" --alias app
+
+      - name: Run strict readiness gate
+        run: tembeek-local check all app --json --strict-warnings | tee readiness.json

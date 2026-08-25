@@ -1,0 +1,3224 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="1.3.0"
+
+LOCALHOST_ROOT="${TEMBEEK_LOCAL_ROOT:-$HOME/Sites/localhost}"
+DEV_ROOT="${TEMBEEK_DEV_ROOT:-$HOME/Development}"
+CONFIG_DIR="${TEMBEEK_CONFIG_DIR:-$HOME/.config/tembeek-local}"
+CONFIG_FILE="${TEMBEEK_CONFIG_FILE:-$CONFIG_DIR/config}"
+HTTP_PORT="${TEMBEEK_HTTP_PORT:-}"
+PHP_FORMULA="${TEMBEEK_PHP_FORMULA:-php@8.4}"
+PF_CONF="${TEMBEEK_PF_CONF:-/etc/pf.conf}"
+PF_ANCHOR_NAME="${TEMBEEK_PF_ANCHOR_NAME:-com.tembeek.local}"
+PF_ANCHOR_FILE="${TEMBEEK_PF_ANCHOR_FILE:-/etc/pf.anchors/com.tembeek.local}"
+NETWORK_FORWARDER_LABEL="${TEMBEEK_NETWORK_FORWARDER_LABEL:-com.tembeek.local.http-forwarder}"
+NETWORK_FORWARDER_PLIST="${TEMBEEK_NETWORK_FORWARDER_PLIST:-/Library/LaunchDaemons/${NETWORK_FORWARDER_LABEL}.plist}"
+NETWORK_FORWARDER_SCRIPT="${TEMBEEK_NETWORK_FORWARDER_SCRIPT:-/usr/local/libexec/tembeek-local-http-forwarder}"
+
+
+MYSQL_ADMIN_USER="${TEMBEEK_MYSQL_ADMIN_USER:-root}"
+MYSQL_ADMIN_HOST="${TEMBEEK_MYSQL_ADMIN_HOST:-127.0.0.1}"
+MYSQL_ADMIN_PORT="${TEMBEEK_MYSQL_ADMIN_PORT:-3306}"
+MYSQL_ADMIN_PASSWORD="${TEMBEEK_MYSQL_ADMIN_PASSWORD:-}"
+
+bold()   { printf '\033[1m%s\033[0m\n' "$*"; }
+green()  { printf '\033[32m%s\033[0m\n' "$*"; }
+yellow() { printf '\033[33m%s\033[0m\n' "$*"; }
+red()    { printf '\033[31m%s\033[0m\n' "$*"; }
+
+ok()   { green "✓ $*"; }
+warn() { yellow "! $*"; }
+fail() { red "✗ $*"; }
+
+die() {
+  fail "$*"
+  exit 1
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+
+load_machine_config() {
+  local configured_port=""
+  if [[ -f "$CONFIG_FILE" ]]; then
+    configured_port="$(awk -F= '$1=="HTTP_PORT"{print $2; exit}' "$CONFIG_FILE" 2>/dev/null || true)"
+  fi
+  if [[ -z "${HTTP_PORT:-}" ]]; then
+    HTTP_PORT="${configured_port:-8080}"
+  fi
+}
+
+save_machine_http_port() {
+  local port="$1"
+  mkdir -p "$CONFIG_DIR"
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/tembeek-local-config.XXXXXX")"
+  if [[ -f "$CONFIG_FILE" ]]; then
+    awk -v p="$port" '
+      BEGIN {done=0}
+      /^HTTP_PORT=/ { if (!done) { print "HTTP_PORT=" p; done=1 } ; next }
+      { print }
+      END { if (!done) print "HTTP_PORT=" p }
+    ' "$CONFIG_FILE" > "$tmp"
+  else
+    printf 'HTTP_PORT=%s\n' "$port" > "$tmp"
+  fi
+  mv "$tmp" "$CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE"
+}
+
+port_listener_summary() {
+  local port="$1"
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null || true
+  fi
+}
+
+port_is_free() {
+  local port="$1"
+  if command -v lsof >/dev/null 2>&1; then
+    [[ -z "$(lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)" ]]
+  else
+    ! nc -z 127.0.0.1 "$port" >/dev/null 2>&1
+  fi
+}
+
+port_is_owned_only_by_httpd() {
+  local port="$1"
+  local rows
+  rows="$(port_listener_summary "$port")"
+  [[ -n "$rows" ]] || return 1
+  # Ignore header; every listener row must be httpd.
+  local offenders
+  offenders="$(printf '%s\n' "$rows" | awk 'NR>1 && $1!="httpd"{print}')"
+  [[ -z "$offenders" ]]
+}
+
+choose_free_http_port() {
+  local preferred="${1:-8080}"
+  local p="$preferred"
+
+  if port_is_free "$p" || port_is_owned_only_by_httpd "$p"; then
+    echo "$p"
+    return 0
+  fi
+
+  for p in $(seq $((preferred+1)) $((preferred+50))); do
+    if port_is_free "$p"; then
+      echo "$p"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+ensure_tembeek_http_port() {
+  local current="${HTTP_PORT:-8080}"
+  local chosen
+  chosen="$(choose_free_http_port "$current")" || die "Could not find a free Tembeek Apache backend port near $current."
+
+  if [[ "$chosen" != "$current" ]]; then
+    warn "Port $current is occupied by another service."
+    port_listener_summary "$current" | sed 's/^/  /'
+    echo "Selecting Tembeek Apache backend port $chosen instead."
+    HTTP_PORT="$chosen"
+    save_machine_http_port "$HTTP_PORT"
+    ok "Persisted HTTP_PORT=$HTTP_PORT in $CONFIG_FILE"
+  else
+    HTTP_PORT="$chosen"
+    save_machine_http_port "$HTTP_PORT"
+  fi
+}
+
+
+homebrew_php_bin() {
+  local prefix
+  prefix="$(brew --prefix "$PHP_FORMULA" 2>/dev/null || true)"
+  [[ -n "$prefix" ]] || return 1
+  printf '%s/bin/php\n' "$prefix"
+}
+
+active_php_bin() {
+  local brew_php
+  brew_php="$(homebrew_php_bin 2>/dev/null || true)"
+  if [[ -n "$brew_php" && -x "$brew_php" ]]; then
+    printf '%s\n' "$brew_php"
+    return 0
+  fi
+  command -v php
+}
+
+herd_php_bin() {
+  local p
+  p="$(command -v php 2>/dev/null || true)"
+  [[ "$p" == *"/Herd/"* || "$p" == *"/herd/"* ]] || return 1
+  printf '%s\n' "$p"
+}
+
+herd_processes() {
+  ps ax -o pid=,command= 2>/dev/null | grep -Ei '[Hh]erd|Laravel Herd' | grep -v grep || true
+}
+
+
+loopback_port80_listener() {
+  local family="$1"
+  command -v lsof >/dev/null 2>&1 || return 1
+  case "$family" in
+    4) lsof -nP -i4TCP:80 -sTCP:LISTEN 2>/dev/null ;;
+    6) lsof -nP -i6TCP:80 -sTCP:LISTEN 2>/dev/null ;;
+    *) return 2 ;;
+  esac
+}
+
+port80_conflict_with_herd() {
+  local listeners
+  listeners="$(loopback_port80_listener 4 2>/dev/null || true)"
+  listeners+=$'\n'
+  listeners+="$(loopback_port80_listener 6 2>/dev/null || true)"
+  grep -Eqi '(/Applications/Herd\.app|Application Support/Herd|de\.beyondco\.herd|nginx-arm64|nginx-x86)' <<<"$listeners"
+}
+
+herd_localhost_interception_detected() {
+  port80_conflict_with_herd && return 0
+
+  if [[ -n "${HTTP_PORT:-}" ]] && command -v lsof >/dev/null 2>&1; then
+    local backend
+    backend="$(lsof -nP -iTCP:"$HTTP_PORT" -sTCP:LISTEN 2>/dev/null || true)"
+    grep -Eqi '(/Applications/Herd\.app|Application Support/Herd|de\.beyondco\.herd|nginx-arm64|nginx-x86)' <<<"$backend" && return 0
+  fi
+
+  return 1
+}
+
+tembeek_http_probe_headers() {
+  local alias="$1"
+  curl -4 -sS -D - -o /dev/null --max-time 5 "http://${alias}.localhost/" 2>/dev/null || true
+}
+
+
+
+php_extension_loaded() {
+  local ext="$1"
+  local php_bin
+  php_bin="$(active_php_bin 2>/dev/null || true)"
+  [[ -n "$php_bin" && -x "$php_bin" ]] || return 1
+  "$php_bin" -r 'exit(extension_loaded($argv[1]) ? 0 : 1);' "$ext"
+}
+
+mysql_compatible_client() {
+  local candidate
+  for candidate in mysql mariadb; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      command -v "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+mysql_compatible_service_detected() {
+  # Tembeek-local's native DB runtime is Homebrew-managed MySQL/MariaDB,
+  # normally on TCP 3306. External stacks such as MAMP are not authoritative.
+
+  if command -v brew >/dev/null 2>&1; then
+    local svc
+    svc="$(brew services list 2>/dev/null | awk '
+      $1 ~ /^(mysql(@[0-9.]+)?|mariadb(@[0-9.]+)?)$/ && $2 ~ /^(started|scheduled)$/ {
+        print $1
+        exit
+      }
+    ')"
+    [[ -n "$svc" ]] && return 0
+
+    local formula
+    for formula in mysql@8.4 mysql mysql@8.0 mariadb mariadb@11.4 mariadb@11.8; do
+      if brew list --versions "$formula" >/dev/null 2>&1; then
+        # Installed formula alone is not enough unless its conventional port is live.
+        if command -v lsof >/dev/null 2>&1 && \
+           lsof -nP -iTCP:3306 -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {found=1} END{exit(found?0:1)}'
+        then
+          return 0
+        fi
+      fi
+    done
+  fi
+
+  # A conventional MySQL listener on 3306 is acceptable, provided it is not an
+  # obvious external app-bundled runtime.
+  if command -v lsof >/dev/null 2>&1; then
+    local line
+    line="$(lsof -nP -iTCP:3306 -sTCP:LISTEN 2>/dev/null | awk 'NR==2{print; exit}')"
+    if [[ -n "$line" ]]; then
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+mysql_runtime_description() {
+  if command -v brew >/dev/null 2>&1; then
+    local svc
+    svc="$(brew services list 2>/dev/null | awk '
+      $1 ~ /^(mysql(@[0-9.]+)?|mariadb(@[0-9.]+)?)$/ && $2 ~ /^(started|scheduled)$/ {
+        print $1 " (" $2 ")"
+        exit
+      }
+    ')"
+    if [[ -n "$svc" ]]; then
+      printf 'Homebrew service: %s\n' "$svc"
+      return 0
+    fi
+  fi
+
+  if command -v lsof >/dev/null 2>&1; then
+    local line
+    line="$(lsof -nP -iTCP:3306 -sTCP:LISTEN 2>/dev/null | awk 'NR==2{print; exit}')"
+    if [[ -n "$line" ]]; then
+      printf 'TCP 3306 listener: %s\n' "$line"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+usage() {
+  local BOLD RESET DIM CYAN GREEN YELLOW
+  if [[ -t 1 ]]; then
+    BOLD=$'\033[1m'; RESET=$'\033[0m'; DIM=$'\033[2m'
+    CYAN=$'\033[36m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
+  else
+    BOLD=""; RESET=""; DIM=""; CYAN=""; GREEN=""; YELLOW=""
+  fi
+
+  cat <<EOF
+${BOLD}tembeek-local${RESET} ${DIM}v${VERSION}${RESET}
+${DIM}Local bootstrap, Apache/PHP parity, MySQL provisioning, and readiness checks for Tembeek PHP projects.${RESET}
+
+${BOLD}USAGE${RESET}
+  tembeek-local <command> [arguments] [options]
+
+${BOLD}WORKSTATION SETUP${RESET}
+  ${CYAN}setup apache${RESET}
+      Non-interactively configure Homebrew Apache + PHP ${PHP_FORMULA#php@}, *.localhost hosting,
+      mod_rewrite, mod_vhost_alias, .htaccess, and Apache PHP execution.
+
+  ${CYAN}setup network${RESET}
+      Configure a root-owned launchd TCP forwarder from port 80 to Apache port ${HTTP_PORT}.
+
+  ${CYAN}doctor${RESET}
+      Diagnose Homebrew / Apache / canonical PHP / MySQL / network ownership, including Herd conflicts.
+
+${BOLD}PROJECTS${RESET}
+  ${CYAN}init <project-path> [--alias <alias>]${RESET}
+      Detect document root, create .tembeek/local.yaml when absent, bootstrap
+      .env, and register the local alias.
+
+  ${CYAN}add <alias> <project-path>${RESET}
+      Register an existing project as <alias>.localhost.
+
+  ${CYAN}remove <alias>${RESET}
+      Remove only the alias symlink; repository and DB are untouched.
+
+  ${CYAN}list${RESET}
+      List registered aliases.
+
+  ${CYAN}path <alias>${RESET}
+      Print the real path behind an alias.
+
+  ${CYAN}url <alias>${RESET}
+      Print the local backend URL.
+
+  ${CYAN}info <alias>${RESET}
+      Show project/document root, manifest, .env, PHP/hosting, DB and migrations.
+
+${BOLD}DATABASE${RESET}
+  ${CYAN}db create <alias>${RESET}
+      Create the MySQL database and least-scope app user, then update .env.
+
+  ${CYAN}db migrate <alias>${RESET}
+      Run the manifest-declared or detected migration command.
+
+  ${CYAN}db status <alias>${RESET}
+      Check DB connectivity and migration configuration / likely drift.
+
+${BOLD}READINESS${RESET}
+  ${CYAN}check hosting <alias> [--json] [--strict-warnings|--no-strict-warnings]${RESET}
+      Check shared-hosting compatibility: PHP target/extensions, case collisions,
+      local filesystem paths, symlinks, process dependencies, .env hygiene, etc.
+
+  ${CYAN}check all <alias> [--json] [--strict-warnings|--no-strict-warnings]${RESET}
+      Aggregate hosting + database readiness.
+
+      Exit codes:
+        ${GREEN}0${RESET}  passed
+        ${YELLOW}1${RESET}  blocking failure (or warning under strict mode)
+
+${BOLD}POLICY${RESET}
+  ${CYAN}policy validate <alias> [--json]${RESET}
+      Validate .tembeek/local.yaml schema, keys, values and exception IDs.
+
+  ${CYAN}policy migrate <alias>${RESET}
+      Migrate a legacy manifest to schema_version 1 with backup + rollback.
+
+${BOLD}DIAGNOSTICS${RESET}
+  ${CYAN}doctor [alias]${RESET}
+      With an alias, also checks project manifest, .env, DB, hosting readiness,
+      HTTP reachability and alias health.
+
+${BOLD}NETWORK REMOVAL${RESET}
+  ${CYAN}remove network${RESET}
+      Remove Tembeek's launchd/PF forwarding; Apache remains available on :${HTTP_PORT}.
+
+${BOLD}COMMON WORKFLOWS${RESET}
+  New workstation:
+      tembeek-local setup apache
+      tembeek-local setup network
+      tembeek-local doctor
+
+  Newly cloned project:
+      tembeek-local init ~/Development/tembeek-rent-book --alias rentbook
+      tembeek-local policy validate rentbook
+      tembeek-local db create rentbook
+      tembeek-local db migrate rentbook
+      tembeek-local doctor rentbook
+      tembeek-local check all rentbook
+
+  Strict CI:
+      tembeek-local check all rentbook --json --strict-warnings
+
+${BOLD}DEFAULTS${RESET}
+  Alias registry     ${DIM}${LOCALHOST_ROOT}${RESET}
+  Development root  ${DIM}${DEV_ROOT}${RESET}
+  Apache backend    ${DIM}${HTTP_PORT}${RESET}
+  Machine config     ${DIM}${CONFIG_FILE}${RESET}
+  PHP formula       ${DIM}${PHP_FORMULA}${RESET}
+  PF config         ${DIM}${PF_CONF}${RESET}
+  PF anchor         ${DIM}${PF_ANCHOR_NAME}${RESET}
+  MySQL admin       ${DIM}${MYSQL_ADMIN_USER}@${MYSQL_ADMIN_HOST}:${MYSQL_ADMIN_PORT}${RESET}
+
+${BOLD}ENVIRONMENT OVERRIDES${RESET}
+  TEMBEEK_LOCAL_ROOT
+  TEMBEEK_DEV_ROOT
+  TEMBEEK_HTTP_PORT
+  TEMBEEK_PHP_FORMULA
+  TEMBEEK_PF_CONF
+  TEMBEEK_PF_ANCHOR_NAME
+  TEMBEEK_PF_ANCHOR_FILE
+  TEMBEEK_MYSQL_ADMIN_USER
+  TEMBEEK_MYSQL_ADMIN_HOST
+  TEMBEEK_MYSQL_ADMIN_PORT
+  TEMBEEK_MYSQL_ADMIN_PASSWORD
+
+${BOLD}HELP & VERSION${RESET}
+  tembeek-local help | -h | --help
+  tembeek-local version | -v | --version
+
+${DIM}Project contract: .tembeek/local.yaml (schema_version: 1)
+See README.md for full operating and troubleshooting documentation.${RESET}
+EOF
+}
+
+normalize_alias() {
+  local a="$1"
+  a="${a%.localhost}"
+  printf '%s' "$a"
+}
+
+validate_alias() {
+  local a="$1"
+  [[ "$a" =~ ^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$ ]] || \
+    die "Invalid alias '$a'. Use lowercase letters, digits, and hyphens only."
+}
+
+absolute_path() {
+  local p="$1"
+  if [[ "$p" != /* ]]; then
+    p="$PWD/$p"
+  fi
+  (cd "$p" 2>/dev/null && pwd -P) || return 1
+}
+
+ensure_registry() {
+  mkdir -p "$LOCALHOST_ROOT"
+}
+
+brew_prefix() {
+  brew --prefix
+}
+
+httpd_conf_path() {
+  printf '%s/etc/httpd/httpd.conf' "$(brew_prefix)"
+}
+
+managed_conf_path() {
+  printf '%s/etc/httpd/extra/httpd-tembeek-local.conf' "$(brew_prefix)"
+}
+
+php_module_path() {
+  printf '%s/lib/httpd/modules/libphp.so' "$(brew --prefix "$PHP_FORMULA")"
+}
+
+timestamp() {
+  date '+%Y%m%d-%H%M%S'
+}
+
+backup_file() {
+  local file="$1"
+  [[ -e "$file" ]] || return 0
+  local backup="${file}.tembeek-local.$(timestamp).bak"
+  cp -p "$file" "$backup"
+  printf '%s' "$backup"
+}
+
+replace_loadmodule_line() {
+  local file="$1" token="$2" replacement="$3"
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/tembeek-httpd.XXXXXX")"
+
+  awk -v token="$token" -v replacement="$replacement" '
+    BEGIN { done=0 }
+    {
+      line=$0
+      trimmed=line
+      sub(/^[[:space:]]*/, "", trimmed)
+      sub(/^#[[:space:]]*/, "", trimmed)
+      if (!done && trimmed ~ "^LoadModule[[:space:]]+" token "[[:space:]]+") {
+        print replacement
+        done=1
+      } else {
+        print line
+      }
+    }
+    END {
+      if (!done) print replacement
+    }
+  ' "$file" > "$tmp"
+
+  cat "$tmp" > "$file"
+  rm -f "$tmp"
+}
+
+disable_loadmodule_line() {
+  local file="$1" token="$2"
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/tembeek-httpd.XXXXXX")"
+
+  awk -v token="$token" '
+    {
+      line=$0
+      trimmed=line
+      sub(/^[[:space:]]*/, "", trimmed)
+      uncommented=trimmed
+      sub(/^#[[:space:]]*/, "", uncommented)
+      if (uncommented ~ "^LoadModule[[:space:]]+" token "[[:space:]]+") {
+        if (trimmed ~ /^#/) print line
+        else print "#" line
+      } else {
+        print line
+      }
+    }
+  ' "$file" > "$tmp"
+
+  cat "$tmp" > "$file"
+  rm -f "$tmp"
+}
+
+ensure_include_line() {
+  local file="$1" include_path="$2"
+  local canonical="IncludeOptional \"$include_path\""
+
+  if grep -Fq "$canonical" "$file"; then
+    return 0
+  fi
+
+  {
+    echo
+    echo "# Tembeek local development environment"
+    echo "$canonical"
+  } >> "$file"
+}
+
+write_managed_apache_conf() {
+  local managed="$1"
+  local php_module="$2"
+  local log_dir
+  log_dir="$(brew_prefix)/var/log/httpd"
+
+  mkdir -p "$(dirname "$managed")"
+  mkdir -p "$log_dir"
+  mkdir -p "$LOCALHOST_ROOT"
+
+  cat > "$managed" <<EOF
+# -----------------------------------------------------------------------------
+# Managed by tembeek-local ${VERSION}
+# Re-run: tembeek-local setup apache
+# -----------------------------------------------------------------------------
+
+# PHP 8.4 through mod_php.
+LoadModule php_module "$php_module"
+
+<FilesMatch "\\.php$">
+    SetHandler application/x-httpd-php
+</FilesMatch>
+
+<IfModule dir_module>
+    DirectoryIndex index.php index.html
+</IfModule>
+
+<VirtualHost *:${HTTP_PORT}>
+    ServerName localhost
+    ServerAlias *.localhost
+
+    VirtualDocumentRoot "${LOCALHOST_ROOT}/%1"
+
+    <Directory "${LOCALHOST_ROOT}">
+        Options FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+    ErrorLog "${log_dir}/tembeek-local-error.log"
+    CustomLog "${log_dir}/tembeek-local-access.log" combined
+</VirtualHost>
+EOF
+}
+
+ensure_brew_formula() {
+  local formula="$1"
+  if brew list --versions "$formula" >/dev/null 2>&1; then
+    ok "$formula already installed: $(brew list --versions "$formula")"
+  else
+    bold "Installing $formula..."
+    HOMEBREW_NO_ASK=1 HOMEBREW_NO_ENV_HINTS=1 brew install -y "$formula"
+    ok "Installed $formula"
+  fi
+}
+
+configure_php_cli() {
+  if HOMEBREW_NO_ASK=1 HOMEBREW_NO_ENV_HINTS=1 brew link --overwrite --force "$PHP_FORMULA" >/dev/null 2>&1; then
+    ok "Linked $PHP_FORMULA for CLI use"
+  else
+    warn "Could not force-link $PHP_FORMULA; Apache can still use its module"
+  fi
+}
+
+service_state() {
+  local service="$1"
+  brew services list 2>/dev/null | awk -v svc="$service" '$1 == svc {print $2; exit}'
+}
+
+restart_or_start_httpd() {
+  local state
+  state="$(service_state httpd)"
+  if [[ "$state" == "started" ]]; then
+    brew services restart httpd
+    ok "Restarted Homebrew Apache"
+  else
+    brew services start httpd
+    ok "Started Homebrew Apache"
+  fi
+}
+
+
+network_rule_content() {
+  cat <<EOF
+# Managed by tembeek-local ${VERSION}
+rdr pass on lo0 inet proto tcp from any to 127.0.0.1 port 80 -> 127.0.0.1 port ${HTTP_PORT}
+rdr pass on lo0 inet6 proto tcp from any to ::1 port 80 -> ::1 port ${HTTP_PORT}
+EOF
+}
+
+sudo_write_file() {
+  local destination="$1" tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/tembeek-local-root-write.XXXXXX")"
+  cat > "$tmp"
+  sudo install -m 0644 "$tmp" "$destination"
+  rm -f "$tmp"
+}
+
+network_backup_file() {
+  local file="$1"
+  [[ -e "$file" ]] || return 0
+  local backup="${file}.tembeek-local.$(timestamp).bak"
+  sudo cp -p "$file" "$backup"
+  printf '%s' "$backup"
+}
+
+install_pf_conf_lines() {
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/tembeek-pf-conf.XXXXXX")"
+  sudo cat "$PF_CONF" > "$tmp"
+
+  if ! grep -Eq "^[[:space:]]*rdr-anchor[[:space:]]+\"${PF_ANCHOR_NAME}\"[[:space:]]*$" "$tmp"; then
+    local t2
+    t2="$(mktemp "${TMPDIR:-/tmp}/tembeek-pf-conf2.XXXXXX")"
+    awk -v line="rdr-anchor \"'"$PF_ANCHOR_NAME"'\"" '
+      BEGIN { inserted=0 }
+      {
+        print
+        if (!inserted && $0 ~ /^[[:space:]]*rdr-anchor[[:space:]]+/) {
+          print line
+          inserted=1
+        }
+      }
+      END { if (!inserted) print line }
+    ' "$tmp" > "$t2"
+    mv "$t2" "$tmp"
+  fi
+
+  if ! grep -Eq "^[[:space:]]*load[[:space:]]+anchor[[:space:]]+\"${PF_ANCHOR_NAME}\"[[:space:]]+from[[:space:]]+\"${PF_ANCHOR_FILE}\"[[:space:]]*$" "$tmp"; then
+    {
+      echo
+      echo "# Tembeek local development port forwarding"
+      echo "load anchor \"${PF_ANCHOR_NAME}\" from \"${PF_ANCHOR_FILE}\""
+    } >> "$tmp"
+  fi
+
+  sudo install -m 0644 "$tmp" "$PF_CONF"
+  rm -f "$tmp"
+}
+
+validate_pf_configuration() {
+  sudo pfctl -vnf "$PF_CONF" >/tmp/tembeek-local-pf-validate.out 2>&1
+}
+
+load_pf_configuration() {
+  sudo pfctl -f "$PF_CONF" >/tmp/tembeek-local-pf-load.out 2>&1
+  sudo pfctl -e >/tmp/tembeek-local-pf-enable.out 2>&1 || true
+}
+
+network_forwarding_probe() {
+  local probe_alias="tembeek-network-probe-$$" probe_dir probe_link body
+  probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/tembeek-local-network-probe.XXXXXX")"
+  probe_link="$LOCALHOST_ROOT/$probe_alias"
+
+  cat > "$probe_dir/index.php" <<'PHP'
+<?php echo 'TEMBEEK_NETWORK_OK';
+PHP
+
+  ln -s "$probe_dir" "$probe_link"
+  body="$(curl -4 -sS --max-time 4 "http://${probe_alias}.localhost/" 2>/dev/null || true)"
+  rm -f "$probe_link"
+  rm -rf "$probe_dir"
+  [[ "$body" == "TEMBEEK_NETWORK_OK" ]]
+}
+
+
+
+
+ensure_apache_listen_port() {
+  local conf="$1" port="$2" tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/tembeek-httpd-listen.XXXXXX")"
+
+  awk -v p="$port" '
+    BEGIN { replaced=0 }
+    /^[[:space:]]*Listen[[:space:]]+[0-9]+[[:space:]]*$/ {
+      if (!replaced) {
+        print "Listen " p
+        replaced=1
+      }
+      next
+    }
+    { print }
+    END {
+      if (!replaced) print "Listen " p
+    }
+  ' "$conf" > "$tmp"
+
+  cat "$tmp" > "$conf"
+  rm -f "$tmp"
+}
+
+apache_backend_is_listening() {
+  local port="$1"
+  local rows
+  rows="$(port_listener_summary "$port")"
+  [[ -n "$rows" ]] || return 1
+  printf '%s\n' "$rows" | awk 'NR>1 && $1=="httpd"{found=1} END{exit(found?0:1)}'
+}
+
+ensure_socat() {
+  if command -v socat >/dev/null 2>&1; then
+    return 0
+  fi
+  bold "Installing socat for privileged localhost port forwarding..."
+  HOMEBREW_NO_ASK=1 HOMEBREW_NO_ENV_HINTS=1 brew install -y socat
+}
+
+network_forwarder_script_content() {
+  local socat_bin
+  socat_bin="$(command -v socat)"
+  cat <<EOF
+#!/bin/sh
+set -eu
+
+"$socat_bin" "TCP4-LISTEN:80,bind=127.0.0.1,reuseaddr,fork" "TCP4:127.0.0.1:${HTTP_PORT}" &
+pid4=\$!
+
+"$socat_bin" "TCP6-LISTEN:80,bind=[::1],reuseaddr,fork" "TCP4:127.0.0.1:${HTTP_PORT}" &
+pid6=\$!
+
+cleanup() {
+  kill "\$pid4" "\$pid6" 2>/dev/null || true
+}
+trap cleanup INT TERM EXIT
+
+# Keep the launchd job alive while both listeners are healthy.
+while kill -0 "\$pid4" 2>/dev/null && kill -0 "\$pid6" 2>/dev/null; do
+  sleep 5
+done
+
+exit 1
+EOF
+}
+
+network_forwarder_plist_content() {
+  cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${NETWORK_FORWARDER_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${NETWORK_FORWARDER_SCRIPT}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/var/log/tembeek-local-http-forwarder.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/tembeek-local-http-forwarder.err.log</string>
+</dict>
+</plist>
+EOF
+}
+
+install_network_forwarder() {
+  ensure_socat
+
+  if port80_conflict_with_herd; then
+    fail "Laravel Herd currently owns local port 80."
+    echo "Stop Herd's web stack first:"
+    echo "  herd stop"
+    echo
+    echo "Then rerun:"
+    echo "  tembeek-local setup network"
+    return 1
+  fi
+
+  local tmp_script tmp_plist
+  tmp_script="$(mktemp "${TMPDIR:-/tmp}/tembeek-forwarder-script.XXXXXX")"
+  tmp_plist="$(mktemp "${TMPDIR:-/tmp}/tembeek-forwarder-plist.XXXXXX")"
+
+  network_forwarder_script_content > "$tmp_script"
+  network_forwarder_plist_content > "$tmp_plist"
+
+  sudo mkdir -p "$(dirname "$NETWORK_FORWARDER_SCRIPT")"
+  sudo install -m 0755 "$tmp_script" "$NETWORK_FORWARDER_SCRIPT"
+  sudo install -m 0644 "$tmp_plist" "$NETWORK_FORWARDER_PLIST"
+  rm -f "$tmp_script" "$tmp_plist"
+
+  sudo launchctl bootout system/"$NETWORK_FORWARDER_LABEL" >/dev/null 2>&1 || true
+  sudo launchctl bootstrap system "$NETWORK_FORWARDER_PLIST"
+  sudo launchctl enable system/"$NETWORK_FORWARDER_LABEL" >/dev/null 2>&1 || true
+  sudo launchctl kickstart -k system/"$NETWORK_FORWARDER_LABEL"
+
+  sleep 1
+}
+
+remove_network_forwarder() {
+  sudo launchctl bootout system/"$NETWORK_FORWARDER_LABEL" >/dev/null 2>&1 || true
+  sudo rm -f "$NETWORK_FORWARDER_PLIST" "$NETWORK_FORWARDER_SCRIPT"
+}
+
+network_forwarder_is_loaded() {
+  sudo launchctl print system/"$NETWORK_FORWARDER_LABEL" >/dev/null 2>&1
+}
+
+network_forwarder_probe() {
+  curl -4 --silent --show-error --max-time 5 \
+    -H 'Host: localhost' \
+    "http://127.0.0.1/" >/dev/null 2>&1
+}
+
+
+remove_pf_conf_lines() {
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/tembeek-pf-remove.XXXXXX")"
+
+  awk -v anchor="$PF_ANCHOR_NAME" '
+    index($0, "rdr-anchor \"" anchor "\"") { next }
+    index($0, "load anchor \"" anchor "\"") { next }
+    { print }
+  ' "$PF_CONF" > "$tmp"
+
+  sudo install -m 0644 "$tmp" "$PF_CONF"
+  rm -f "$tmp"
+}
+
+pf_lo0_skip_present() {
+  [[ -f "$PF_CONF" ]] || return 1
+  grep -Eq '^[[:space:]]*set[[:space:]]+skip[[:space:]]+on[[:space:]]+lo0[[:space:]]*$' "$PF_CONF"
+}
+
+pf_disable_lo0_skip_for_tembeek() {
+  pf_lo0_skip_present || return 0
+
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/tembeek-pf-lo0.XXXXXX")"
+
+  awk '
+    /^[[:space:]]*set[[:space:]]+skip[[:space:]]+on[[:space:]]+lo0[[:space:]]*$/ {
+      print "# TEMBEEK-LOCAL-DISABLED: set skip on lo0"
+      changed=1
+      next
+    }
+    { print }
+    END { if (!changed) exit 3 }
+  ' "$PF_CONF" > "$tmp" || {
+    rm -f "$tmp"
+    return 1
+  }
+
+  sudo install -m 0644 "$tmp" "$PF_CONF"
+  rm -f "$tmp"
+}
+
+pf_restore_lo0_skip_marker() {
+  [[ -f "$PF_CONF" ]] || return 0
+  sudo grep -Fq '# TEMBEEK-LOCAL-DISABLED: set skip on lo0' "$PF_CONF" || return 0
+
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/tembeek-pf-lo0-restore.XXXXXX")"
+  sudo cat "$PF_CONF" | awk '
+    $0 == "# TEMBEEK-LOCAL-DISABLED: set skip on lo0" {
+      print "set skip on lo0"
+      next
+    }
+    { print }
+  ' > "$tmp"
+
+  sudo install -m 0644 "$tmp" "$PF_CONF"
+  rm -f "$tmp"
+}
+
+pf_rdr_packet_count() {
+  sudo pfctl -a "$PF_ANCHOR_NAME" -s nat -v 2>/dev/null \
+    | awk '/Packets:/ {
+        for (i=1; i<=NF; i++) {
+          if ($i=="Packets:") { print $(i+1); exit }
+        }
+      }'
+}
+
+
+doctor_network() {
+  load_machine_config
+
+  if herd_localhost_interception_detected; then
+    warn "Laravel Herd is intercepting a Tembeek-critical HTTP listener"
+    local herd
+    herd="$(herd_processes)"
+    [[ -n "$herd" ]] && printf '%s\n' "$herd" | sed 's/^/  /'
+  fi
+
+  if network_forwarder_is_loaded; then
+    ok "launchd HTTP forwarder loaded: $NETWORK_FORWARDER_LABEL"
+  else
+    warn "launchd HTTP forwarder is not loaded"
+  fi
+
+  if apache_backend_is_listening "$HTTP_PORT"; then
+    ok "Apache backend listener available on port $HTTP_PORT"
+  else
+    fail "Apache backend listener missing on port $HTTP_PORT"
+    return 1
+  fi
+
+  local failed=0
+  if curl -4 --silent --show-error --max-time 5 "http://127.0.0.1/" >/dev/null 2>&1; then
+    ok "IPv4 port-80 forwarding responds"
+  else
+    fail "IPv4 port-80 forwarding is unavailable"
+    failed=1
+  fi
+
+  if curl -6 --silent --show-error --max-time 5 "http://[::1]/" >/dev/null 2>&1; then
+    ok "IPv6 port-80 forwarding responds"
+  else
+    fail "IPv6 port-80 forwarding is unavailable"
+    failed=1
+  fi
+
+  [[ "$failed" -eq 0 ]]
+}
+
+cmd_setup_network() {
+  load_machine_config
+  [[ $# -eq 0 ]] || die "Usage: tembeek-local setup network"
+
+  require_cmd curl || die "curl is required."
+  require_cmd brew || die "Homebrew is required."
+  require_cmd launchctl || die "launchctl is required."
+
+  if ! apache_backend_is_listening "$HTTP_PORT"; then
+    fail "Tembeek Apache is not listening on configured backend port $HTTP_PORT."
+    echo
+    echo "Listeners on port $HTTP_PORT:"
+    port_listener_summary "$HTTP_PORT" | sed 's/^/  /'
+    echo
+    echo "Run this first:"
+    echo "  tembeek-local setup apache"
+    return 1
+  fi
+
+  if lsof -nP -iTCP:80 -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {print $1}' | grep -Evqx 'socat'; then
+    warn "Another process is already listening on TCP port 80."
+    lsof -nP -iTCP:80 -sTCP:LISTEN 2>/dev/null | sed 's/^/  /'
+    if herd_processes | grep -q .; then
+      warn "Laravel Herd appears active. It can claim/intercept local development hostnames."
+      echo "Tembeek-local requires exclusive ownership of 127.0.0.1:80 for its .localhost forwarding."
+    fi
+  fi
+
+  echo
+  bold "Tembeek local network setup"
+  echo
+  echo "Configuring privileged localhost HTTP forwarding:"
+  echo "  127.0.0.1:80 -> 127.0.0.1:${HTTP_PORT}"
+  echo
+  echo "Implementation: root-owned launchd + socat"
+  echo
+
+  # Remove old Tembeek PF redirect if present so the two mechanisms never compete.
+  if sudo test -f "$PF_ANCHOR_FILE" 2>/dev/null; then
+    echo "Removing legacy Tembeek PF forwarding..."
+    local backup=""
+    if sudo test -f "$PF_CONF"; then
+      backup="$(network_backup_file "$PF_CONF")"
+      remove_pf_conf_lines
+      pf_restore_lo0_skip_marker
+    fi
+    sudo rm -f "$PF_ANCHOR_FILE"
+    if [[ -n "$backup" ]] && ! validate_pf_configuration; then
+      sudo cp -p "$backup" "$PF_CONF"
+      die "Could not safely remove legacy Tembeek PF configuration."
+    fi
+    sudo pfctl -f "$PF_CONF" >/dev/null 2>&1 || true
+    ok "Legacy Tembeek PF forwarding removed"
+  fi
+
+  install_network_forwarder || return 1
+
+  if ! curl -4 --silent --show-error --max-time 5 "http://127.0.0.1/" >/dev/null 2>&1; then
+    die "IPv4 local port-80 forwarder verification failed."
+  fi
+  if ! curl -6 --silent --show-error --max-time 5 "http://[::1]/" >/dev/null 2>&1; then
+    die "IPv6 local port-80 forwarder verification failed."
+  fi
+
+  if ! network_forwarder_is_loaded; then
+    fail "Launchd HTTP forwarder did not load."
+    echo "Inspect:"
+    echo "  sudo launchctl print system/$NETWORK_FORWARDER_LABEL"
+    echo "  sudo cat /var/log/tembeek-local-http-forwarder.err.log"
+    return 1
+  fi
+
+  if curl -4 --silent --show-error --max-time 5 "http://127.0.0.1/" >/dev/null 2>&1; then
+    ok "Port 80 -> ${HTTP_PORT} forwarding works"
+  else
+    fail "Launchd forwarder is loaded, but the port-80 probe failed."
+    echo
+    echo "Port 80 listeners:"
+    port_listener_summary 80 | sed 's/^/  /'
+    echo
+    echo "Forwarder status:"
+    sudo launchctl print system/"$NETWORK_FORWARDER_LABEL" 2>&1 | sed 's/^/  /' || true
+    echo
+    echo "Forwarder errors:"
+    sudo tail -n 50 /var/log/tembeek-local-http-forwarder.err.log 2>/dev/null | sed 's/^/  /' || true
+    return 1
+  fi
+
+  echo
+  ok "Local HTTP forwarding configured"
+  echo "Canonical project URLs remain: http://<alias>.localhost"
+}
+
+
+cmd_remove_network() {
+  [[ $# -eq 0 ]] || die "Usage: tembeek-local remove network"
+
+  echo
+  bold "Removing Tembeek local network forwarding"
+
+  if sudo test -f "$NETWORK_FORWARDER_PLIST" 2>/dev/null || network_forwarder_is_loaded; then
+    remove_network_forwarder
+    ok "Removed launchd HTTP forwarder"
+  else
+    echo "No Tembeek launchd HTTP forwarder is installed."
+  fi
+
+  # Also clean up legacy PF state from v1.0.x installations.
+  if sudo test -f "$PF_ANCHOR_FILE" 2>/dev/null || grep -Fq "$PF_ANCHOR_NAME" "$PF_CONF" 2>/dev/null; then
+    local backup
+    backup="$(network_backup_file "$PF_CONF")"
+    remove_pf_conf_lines
+    pf_restore_lo0_skip_marker
+    sudo rm -f "$PF_ANCHOR_FILE"
+
+    if ! validate_pf_configuration; then
+      sudo cp -p "$backup" "$PF_CONF"
+      die "PF cleanup validation failed; restored previous PF configuration."
+    fi
+    sudo pfctl -f "$PF_CONF" >/dev/null 2>&1 || true
+    ok "Removed legacy Tembeek PF forwarding"
+  fi
+
+  echo
+  ok "Network forwarding removed"
+}
+
+
+cmd_setup_apache() {
+  ensure_tembeek_http_port
+  [[ $# -eq 0 ]] || die "Usage: tembeek-local setup apache"
+
+  require_cmd brew || die "Homebrew is required. Install Homebrew first."
+
+  bold "Tembeek Apache/PHP 8.4 setup"
+  echo
+
+  ensure_brew_formula httpd
+  ensure_brew_formula "$PHP_FORMULA"
+
+  configure_php_cli
+  ensure_registry
+
+  local conf managed php_module
+  conf="$(httpd_conf_path)"
+  managed="$(managed_conf_path)"
+  php_module="$(php_module_path)"
+
+  [[ -f "$conf" ]] || die "Homebrew Apache config not found: $conf"
+  [[ -f "$php_module" ]] || die "PHP Apache module not found: $php_module"
+
+  local conf_backup managed_backup=""
+  conf_backup="$(backup_file "$conf")"
+  if [[ -e "$managed" ]]; then
+    managed_backup="$(backup_file "$managed")"
+  fi
+
+  ok "Backed up Apache configuration"
+
+  # mod_php requires prefork; make the MPM choice explicit.
+  disable_loadmodule_line "$conf" "mpm_event_module"
+  disable_loadmodule_line "$conf" "mpm_worker_module"
+  replace_loadmodule_line "$conf" "mpm_prefork_module" \
+    "LoadModule mpm_prefork_module lib/httpd/modules/mod_mpm_prefork.so"
+
+  # Modules required by portable shared-hosting-style .htaccess and wildcard aliases.
+  replace_loadmodule_line "$conf" "rewrite_module" \
+    "LoadModule rewrite_module lib/httpd/modules/mod_rewrite.so"
+  replace_loadmodule_line "$conf" "vhost_alias_module" \
+    "LoadModule vhost_alias_module lib/httpd/modules/mod_vhost_alias.so"
+
+  # Prevent duplicate php_module declarations if the user previously added one manually.
+  disable_loadmodule_line "$conf" "php_module"
+
+  # A <VirtualHost *:PORT> does not make Apache listen on PORT by itself.
+  # Keep the global listener converged with the machine-selected Tembeek backend.
+  ensure_apache_listen_port "$conf" "$HTTP_PORT"
+
+  write_managed_apache_conf "$managed" "$php_module"
+  ensure_include_line "$conf" "$managed"
+
+  if httpd -t >/tmp/tembeek-local-setup-httpd.out 2>&1; then
+    ok "Apache configuration syntax is valid"
+  else
+    fail "Apache configuration failed validation; rolling back"
+    sed 's/^/  /' /tmp/tembeek-local-setup-httpd.out >&2
+
+    cp -p "$conf_backup" "$conf"
+    if [[ -n "$managed_backup" ]]; then
+      cp -p "$managed_backup" "$managed"
+    else
+      rm -f "$managed"
+    fi
+    die "Rollback complete. No invalid Apache configuration was left active."
+  fi
+
+  restart_or_start_httpd
+  sleep 1
+
+  if apache_backend_is_listening "$HTTP_PORT"; then
+    ok "Apache is listening on backend port $HTTP_PORT"
+  else
+    fail "Apache did not bind the selected Tembeek backend port $HTTP_PORT."
+    echo
+    echo "Listeners on port $HTTP_PORT:"
+    port_listener_summary "$HTTP_PORT" | sed 's/^/  /'
+    echo
+    echo "Configured Apache Listen directives:"
+    grep -nE '^[[:space:]]*Listen[[:space:]]+' "$conf" | sed 's/^/  /' || true
+    return 1
+  fi
+
+  echo
+  bold "Verification"
+  local modules
+  modules="$(httpd -M 2>/dev/null || true)"
+
+  grep -q 'mpm_prefork_module' <<<"$modules" \
+    && ok "mpm_prefork loaded" \
+    || die "Apache started but mpm_prefork is not loaded"
+
+  grep -q 'rewrite_module' <<<"$modules" \
+    && ok "mod_rewrite loaded" \
+    || die "Apache started but mod_rewrite is not loaded"
+
+  grep -q 'vhost_alias_module' <<<"$modules" \
+    && ok "mod_vhost_alias loaded" \
+    || die "Apache started but mod_vhost_alias is not loaded"
+
+  grep -q 'php_module' <<<"$modules" \
+    && ok "PHP Apache module loaded" \
+    || die "Apache started but php_module is not loaded"
+
+  local php_ver=""
+  if require_cmd php; then
+    php_ver="$("$(active_php_bin)" -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true)"
+  fi
+
+  if [[ "$php_ver" == "8.4" ]]; then
+    ok "PHP CLI is 8.4 ($(php -r 'echo PHP_VERSION;'))"
+  else
+    warn "Apache PHP is configured for $PHP_FORMULA, but current shell PHP is ${php_ver:-not found}. Open a new shell or update PATH if needed."
+  fi
+
+  echo
+  ok "Apache/PHP setup complete"
+  printf 'Managed config: %s\n' "$managed"
+  printf 'Alias root:     %s\n' "$LOCALHOST_ROOT"
+  printf 'Local URL form: http://<alias>.localhost:%s\n' "$HTTP_PORT"
+  echo
+  echo "Next:"
+  echo "  tembeek-local add rentbook ~/Development/tembeek-rent-book"
+  echo "  tembeek-local doctor rentbook"
+}
+
+cmd_setup() {
+  local target="${1:-}"
+  shift || true
+
+  case "$target" in
+    apache) cmd_setup_apache "$@" ;;
+    network) cmd_setup_network "$@" ;;
+    "") die "Usage: tembeek-local setup <apache|network>" ;;
+    *) die "Unknown setup target: $target" ;;
+  esac
+}
+
+
+yaml_value() {
+  local file="$1" key="$2"
+  [[ -f "$file" ]] || return 1
+  awk -v key="$key" '
+    BEGIN { FS=":" }
+    /^[[:space:]]*#/ { next }
+    {
+      k=$1
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
+      if (k == key) {
+        $1=""
+        sub(/^:/, "")
+        v=$0
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+        gsub(/^"|"$/, "", v)
+        print v
+        exit
+      }
+    }
+  ' "$file"
+}
+
+detect_project_type() {
+  local project="$1"
+  if [[ -f "$project/composer.json" || -f "$project/index.php" || -d "$project/public" ]]; then
+    echo "php"
+  else
+    echo "unknown"
+  fi
+}
+
+detect_document_root() {
+  local project="$1"
+  local manifest="$project/.tembeek/local.yaml"
+  local configured=""
+
+  if [[ -f "$manifest" ]]; then
+    configured="$(yaml_value "$manifest" "document_root" || true)"
+    if [[ -n "$configured" ]]; then
+      if [[ "$configured" == "." ]]; then
+        echo "$project"
+      else
+        echo "$project/$configured"
+      fi
+      return 0
+    fi
+  fi
+
+  if [[ -f "$project/public/index.php" ]]; then
+    echo "$project/public"
+  else
+    echo "$project"
+  fi
+}
+
+infer_alias() {
+  local project="$1"
+  local manifest="$project/.tembeek/local.yaml"
+  local configured=""
+  if [[ -f "$manifest" ]]; then
+    configured="$(yaml_value "$manifest" "alias" || true)"
+    [[ -n "$configured" ]] && { echo "$configured"; return 0; }
+  fi
+
+  local name
+  name="$(basename "$project")"
+  name="${name#tembeek-}"
+  name="${name//_/-}"
+  echo "$name"
+}
+
+ensure_env_file() {
+  local project="$1" alias="$2"
+  local env_file="$project/.env"
+  local example="$project/.env.example"
+
+  if [[ -f "$env_file" ]]; then
+    ok ".env already exists"
+    return 0
+  fi
+
+  if [[ -f "$example" ]]; then
+    cp "$example" "$env_file"
+    ok "Created .env from .env.example"
+  else
+    cat > "$env_file" <<EOF
+APP_ENV=local
+APP_URL=http://${alias}.localhost
+EOF
+    ok "Created minimal .env"
+  fi
+
+  if grep -q '^APP_URL=' "$env_file"; then
+    local tmp
+    tmp="$(mktemp "${TMPDIR:-/tmp}/tembeek-env.XXXXXX")"
+    awk -v url="http://${alias}.localhost" '
+      /^APP_URL=/ { print "APP_URL=" url; next }
+      { print }
+    ' "$env_file" > "$tmp"
+    mv "$tmp" "$env_file"
+  else
+    printf '\nAPP_URL=http://%s.localhost\n' "$alias" >> "$env_file"
+  fi
+
+  if grep -q '^APP_ENV=' "$env_file"; then
+    local tmp2
+    tmp2="$(mktemp "${TMPDIR:-/tmp}/tembeek-env2.XXXXXX")"
+    awk '
+      /^APP_ENV=/ { print "APP_ENV=local"; next }
+      { print }
+    ' "$env_file" > "$tmp2"
+    mv "$tmp2" "$env_file"
+  else
+    printf 'APP_ENV=local\n' >> "$env_file"
+  fi
+}
+
+write_manifest() {
+  local project="$1" alias="$2" document_root="$3"
+  mkdir -p "$project/.tembeek"
+
+  local rel="."
+  if [[ "$document_root" != "$project" ]]; then
+    rel="${document_root#"$project"/}"
+  fi
+
+  cat > "$project/.tembeek/local.yaml" <<EOF
+schema_version: 1
+project: $(basename "$project")
+type: php
+alias: $alias
+document_root: $rel
+php_version: "8.4"
+hosting_profile: shared-hosting
+production_php_version: "8.4"
+strict_warnings: false
+required_extensions: []
+allowed_symlinks: []
+allowed_process_dependencies: []
+policy_exceptions: []
+EOF
+
+  if detect_database_need "$project"; then
+    yaml_set "$project/.tembeek/local.yaml" database_engine mysql
+    yaml_set "$project/.tembeek/local.yaml" database_name "$(default_database_name "$alias")"
+    yaml_set "$project/.tembeek/local.yaml" database_user "$(default_database_user "$alias")"
+    yaml_set "$project/.tembeek/local.yaml" migration_dir "$(detect_migration_dir "$project")"
+    yaml_set "$project/.tembeek/local.yaml" migration_command "$(detect_migration_command "$project")"
+  else
+    yaml_set "$project/.tembeek/local.yaml" database_engine none
+  fi
+
+  ok "Wrote .tembeek/local.yaml"
+}
+
+register_alias_target() {
+  local alias="$1" target="$2"
+  ensure_registry
+  local link="$LOCALHOST_ROOT/$alias"
+
+  if [[ -L "$link" ]]; then
+    local current
+    current="$(readlink "$link")"
+    if [[ "$current" == "$target" ]]; then
+      ok "Alias already registered: $alias.localhost"
+      return 0
+    fi
+    die "Alias '$alias' already points to $current"
+  fi
+
+  [[ ! -e "$link" ]] || die "Alias path exists and is not a symlink: $link"
+  ln -s "$target" "$link"
+  ok "Registered $alias.localhost -> $target"
+}
+
+cmd_init() {
+  [[ $# -ge 1 ]] || die "Usage: tembeek-local init <project-path> [--alias <alias>]"
+  local project alias=""
+  project="$(absolute_path "$1")" || die "Project path does not exist: $1"
+  shift
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --alias)
+        shift
+        [[ $# -gt 0 ]] || die "--alias requires a value"
+        alias="$(normalize_alias "$1")"
+        ;;
+      *)
+        die "Unknown init option: $1"
+        ;;
+    esac
+    shift
+  done
+
+  [[ "$(detect_project_type "$project")" == "php" ]] || die "Project does not look like a PHP project: $project"
+
+  [[ -n "$alias" ]] || alias="$(infer_alias "$project")"
+  validate_alias "$alias"
+
+  local document_root
+  document_root="$(detect_document_root "$project")"
+  [[ -d "$document_root" ]] || die "Detected document root does not exist: $document_root"
+
+  bold "Initializing Tembeek PHP project"
+  echo "Project:       $project"
+  echo "Alias:         $alias.localhost"
+  echo "Document root: $document_root"
+  echo
+
+  if [[ ! -f "$project/.tembeek/local.yaml" ]]; then
+    write_manifest "$project" "$alias" "$document_root"
+  else
+    ok "Manifest already exists"
+  fi
+
+  ensure_env_file "$project" "$alias"
+  register_alias_target "$alias" "$document_root"
+
+  echo
+  green "Project initialized"
+  echo "URL: http://${alias}.localhost"
+}
+
+cmd_info() {
+  [[ $# -eq 1 ]] || die "Usage: tembeek-local info <alias>"
+  local alias target project manifest
+  alias="$(normalize_alias "$1")"
+  validate_alias "$alias"
+  target="$LOCALHOST_ROOT/$alias"
+  [[ -L "$target" ]] || die "Alias does not exist: $alias"
+
+  project="$(cd "$target/.." 2>/dev/null && pwd -P || true)"
+  # Resolve actual docroot and infer project root when /public is used.
+  local resolved
+  resolved="$(cd "$target" && pwd -P)"
+  project="$resolved"
+  if [[ "$(basename "$resolved")" == "public" && -d "$(dirname "$resolved")/.tembeek" ]]; then
+    project="$(dirname "$resolved")"
+  fi
+
+  manifest="$project/.tembeek/local.yaml"
+
+  bold "Tembeek project info"
+  printf '%-16s %s\n' "Alias:" "$alias.localhost"
+  printf '%-16s %s\n' "URL:" "http://${alias}.localhost"
+  printf '%-16s %s\n' "Document root:" "$resolved"
+  printf '%-16s %s\n' "Project root:" "$project"
+  printf '%-16s %s\n' "Manifest:" "${manifest}"
+  printf '%-16s %s\n' ".env:" "$project/.env"
+
+  if [[ -f "$manifest" ]]; then
+    printf '%-16s %s\n' "PHP:" "$(yaml_value "$manifest" "php_version" || true)"
+    printf '%-16s %s\n' "Hosting:" "$(yaml_value "$manifest" "hosting_profile" || true)"
+    printf '%-16s %s\n' "Database:" "$(yaml_value "$manifest" "database_engine" || true)"
+    printf '%-16s %s\n' "DB name:" "$(yaml_value "$manifest" "database_name" || true)"
+    printf '%-16s %s\n' "Migrations:" "$(yaml_value "$manifest" "migration_command" || true)"
+  fi
+}
+
+project_doctor_checks() {
+  local alias="$1"
+  local target="$LOCALHOST_ROOT/$alias"
+  [[ -L "$target" ]] || return 1
+
+  local resolved project manifest
+  resolved="$(cd "$target" && pwd -P)"
+  project="$resolved"
+  if [[ "$(basename "$resolved")" == "public" && -d "$(dirname "$resolved")/.tembeek" ]]; then
+    project="$(dirname "$resolved")"
+  fi
+  manifest="$project/.tembeek/local.yaml"
+
+  [[ -f "$manifest" ]] && ok "Project manifest exists" || warn "No .tembeek/local.yaml manifest"
+  [[ -f "$project/.env" ]] && ok ".env exists" || warn ".env missing"
+
+  if [[ -f "$project/.env" ]]; then
+    grep -q '^APP_ENV=local$' "$project/.env" \
+      && ok "APP_ENV=local" \
+      || warn "APP_ENV is not exactly 'local'"
+
+    grep -q "^APP_URL=http://${alias}\.localhost" "$project/.env" \
+      && ok "APP_URL matches alias" \
+      || warn "APP_URL does not match http://${alias}.localhost"
+  fi
+
+  if [[ -f "$manifest" ]]; then
+    local declared
+    declared="$(yaml_value "$manifest" "alias" || true)"
+    [[ -z "$declared" || "$declared" == "$alias" ]] \
+      && ok "Manifest alias matches" \
+      || warn "Manifest alias '$declared' differs from '$alias'"
+  fi
+}
+
+
+env_value() {
+  local file="$1" key="$2"
+  [[ -f "$file" ]] || return 1
+  awk -v key="$key" '
+    index($0, key "=") == 1 {
+      v=substr($0, length(key)+2)
+      gsub(/^"|"$/, "", v)
+      print v
+      exit
+    }
+  ' "$file"
+}
+
+env_set() {
+  local file="$1" key="$2" value="$3"
+  touch "$file"
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/tembeek-env-set.XXXXXX")"
+  awk -v key="$key" -v value="$value" '
+    BEGIN { done=0 }
+    index($0, key "=") == 1 {
+      if (!done) {
+        print key "=" value
+        done=1
+      }
+      next
+    }
+    { print }
+    END {
+      if (!done) print key "=" value
+    }
+  ' "$file" > "$tmp"
+  mv "$tmp" "$file"
+}
+
+yaml_set() {
+  local file="$1" key="$2" value="$3"
+  mkdir -p "$(dirname "$file")"
+  touch "$file"
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/tembeek-yaml-set.XXXXXX")"
+  awk -v key="$key" -v value="$value" '
+    BEGIN { done=0 }
+    {
+      line=$0
+      k=line
+      sub(/:.*/, "", k)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", k)
+      if (k == key) {
+        if (!done) {
+          print key ": " value
+          done=1
+        }
+        next
+      }
+      print line
+    }
+    END {
+      if (!done) print key ": " value
+    }
+  ' "$file" > "$tmp"
+  mv "$tmp" "$file"
+}
+
+resolve_project_root() {
+  local alias="$1"
+  local link="$LOCALHOST_ROOT/$alias"
+  [[ -L "$link" ]] || return 1
+
+  local resolved
+  resolved="$(cd "$link" && pwd -P)"
+
+  if [[ -f "$resolved/.tembeek/local.yaml" ]]; then
+    echo "$resolved"
+    return 0
+  fi
+
+  if [[ -f "$(dirname "$resolved")/.tembeek/local.yaml" ]]; then
+    echo "$(dirname "$resolved")"
+    return 0
+  fi
+
+  # Conventional public/ document root fallback.
+  if [[ "$(basename "$resolved")" == "public" ]]; then
+    echo "$(dirname "$resolved")"
+  else
+    echo "$resolved"
+  fi
+}
+
+detect_database_need() {
+  local project="$1"
+  local env_example="$project/.env.example"
+
+  if [[ -f "$env_example" ]] && grep -Eq '^DB_(HOST|DATABASE|USERNAME|PASSWORD)=' "$env_example"; then
+    return 0
+  fi
+
+  [[ -f "$project/bin/migrate.php" ]] && return 0
+  [[ -d "$project/migrations" ]] && return 0
+  [[ -d "$project/database/migrations" ]] && return 0
+  [[ -d "$project/db/migrations" ]] && return 0
+  return 1
+}
+
+detect_migration_dir() {
+  local project="$1"
+  local manifest="$project/.tembeek/local.yaml"
+  local configured=""
+  configured="$(yaml_value "$manifest" "migration_dir" 2>/dev/null || true)"
+  if [[ -n "$configured" && "$configured" != "none" ]]; then
+    echo "$configured"
+    return 0
+  fi
+
+  local d
+  for d in migrations database/migrations db/migrations; do
+    [[ -d "$project/$d" ]] && { echo "$d"; return 0; }
+  done
+  echo "none"
+}
+
+detect_migration_command() {
+  local project="$1"
+  local manifest="$project/.tembeek/local.yaml"
+  local configured=""
+  configured="$(yaml_value "$manifest" "migration_command" 2>/dev/null || true)"
+  if [[ -n "$configured" && "$configured" != "none" ]]; then
+    echo "$configured"
+    return 0
+  fi
+
+  if [[ -f "$project/bin/migrate.php" ]]; then
+    echo "php bin/migrate.php"
+  elif [[ -f "$project/artisan" ]]; then
+    echo "php artisan migrate --force"
+  else
+    echo "none"
+  fi
+}
+
+safe_db_identifier() {
+  local value="$1"
+  [[ "$value" =~ ^[A-Za-z0-9_]+$ ]] || die "Unsafe database identifier: $value"
+}
+
+default_database_name() {
+  local alias="$1"
+  local clean="${alias//-/_}"
+  printf 'tembeek_%s' "$clean"
+}
+
+default_database_user() {
+  local alias="$1"
+  local clean="${alias//-/_}"
+  local user="tl_${clean}"
+  printf '%.32s' "$user"
+}
+
+generate_db_password() {
+  if require_cmd openssl; then
+    openssl rand -hex 16
+  else
+    LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32
+  fi
+}
+
+mysql_admin_base_args() {
+  printf '%s\n' "-h" "$MYSQL_ADMIN_HOST" "-P" "$MYSQL_ADMIN_PORT" "-u" "$MYSQL_ADMIN_USER"
+}
+
+mysql_admin_exec() {
+  local sql="$1"
+  local -a args=()
+  while IFS= read -r part; do args+=("$part"); done < <(mysql_admin_base_args)
+
+  if [[ -n "$MYSQL_ADMIN_PASSWORD" ]]; then
+    MYSQL_PWD="$MYSQL_ADMIN_PASSWORD" mysql "${args[@]}" -e "$sql"
+  else
+    mysql "${args[@]}" -e "$sql"
+  fi
+}
+
+mysql_trigger_policy_value() {
+  mysql_admin_exec "SELECT @@GLOBAL.log_bin_trust_function_creators;" 2>/dev/null \
+    | tail -n 1 | tr -d '[:space:]'
+}
+
+ensure_mysql_local_trigger_policy() {
+  local current
+  current="$(mysql_trigger_policy_value 2>/dev/null || true)"
+
+  if [[ "$current" == "1" || "$current" == "ON" || "$current" == "on" ]]; then
+    ok "MySQL permits local trigger/function creation without SUPER"
+    return 0
+  fi
+
+  if [[ -z "$current" ]]; then
+    fail "Could not inspect MySQL trigger/function policy with the configured admin account."
+    echo "Set TEMBEEK_MYSQL_ADMIN_USER / TEMBEEK_MYSQL_ADMIN_PASSWORD as needed."
+    return 1
+  fi
+
+  bold "Configuring local MySQL trigger/function migration policy..."
+  if ! mysql_admin_exec "SET GLOBAL log_bin_trust_function_creators = 1;" >/dev/null 2>&1; then
+    fail "Could not enable log_bin_trust_function_creators."
+    echo "Do not grant SUPER to the project application user."
+    return 1
+  fi
+
+  current="$(mysql_trigger_policy_value 2>/dev/null || true)"
+  if [[ "$current" == "1" || "$current" == "ON" || "$current" == "on" ]]; then
+    ok "Enabled log_bin_trust_function_creators for local MySQL"
+    return 0
+  fi
+
+  fail "MySQL did not retain log_bin_trust_function_creators=1."
+  return 1
+}
+
+
+mysql_admin_query() {
+  local sql="$1"
+  local -a args=()
+  while IFS= read -r part; do args+=("$part"); done < <(mysql_admin_base_args)
+
+  if [[ -n "$MYSQL_ADMIN_PASSWORD" ]]; then
+    MYSQL_PWD="$MYSQL_ADMIN_PASSWORD" mysql "${args[@]}" -N -B -e "$sql"
+  else
+    mysql "${args[@]}" -N -B -e "$sql"
+  fi
+}
+
+mysql_app_query() {
+  local project="$1" sql="$2"
+  local env_file="$project/.env"
+  local host port db user pass
+  host="$(env_value "$env_file" DB_HOST || true)"
+  port="$(env_value "$env_file" DB_PORT || true)"
+  db="$(env_value "$env_file" DB_DATABASE || true)"
+  user="$(env_value "$env_file" DB_USERNAME || true)"
+  pass="$(env_value "$env_file" DB_PASSWORD || true)"
+
+  host="${host:-127.0.0.1}"
+  port="${port:-3306}"
+
+  [[ -n "$db" && -n "$user" ]] || return 2
+
+  if [[ -n "$pass" ]]; then
+    MYSQL_PWD="$pass" mysql -h "$host" -P "$port" -u "$user" "$db" -N -B -e "$sql"
+  else
+    mysql -h "$host" -P "$port" -u "$user" "$db" -N -B -e "$sql"
+  fi
+}
+
+ensure_database_manifest_defaults() {
+  local project="$1" alias="$2"
+  local manifest="$project/.tembeek/local.yaml"
+
+  local engine
+  engine="$(yaml_value "$manifest" "database_engine" 2>/dev/null || true)"
+  if [[ -z "$engine" || "$engine" == "none" ]]; then
+    yaml_set "$manifest" database_engine mysql
+  fi
+
+  local db user mdir mcmd
+  db="$(yaml_value "$manifest" "database_name" 2>/dev/null || true)"
+  user="$(yaml_value "$manifest" "database_user" 2>/dev/null || true)"
+  [[ -n "$db" ]] || yaml_set "$manifest" database_name "$(default_database_name "$alias")"
+  [[ -n "$user" ]] || yaml_set "$manifest" database_user "$(default_database_user "$alias")"
+
+  mdir="$(detect_migration_dir "$project")"
+  mcmd="$(detect_migration_command "$project")"
+  yaml_set "$manifest" migration_dir "$mdir"
+  yaml_set "$manifest" migration_command "$mcmd"
+}
+
+cmd_db_create() {
+  [[ $# -eq 1 ]] || die "Usage: tembeek-local db create <alias>"
+  require_cmd mysql || die "mysql client is required."
+
+  local alias project manifest env_file engine db user pass
+  alias="$(normalize_alias "$1")"
+  validate_alias "$alias"
+  project="$(resolve_project_root "$alias")" || die "Alias does not exist: $alias"
+  manifest="$project/.tembeek/local.yaml"
+  env_file="$project/.env"
+
+  [[ -f "$manifest" ]] || die "Project manifest missing. Run: tembeek-local init $project --alias $alias"
+  ensure_database_manifest_defaults "$project" "$alias"
+
+  engine="$(yaml_value "$manifest" database_engine || true)"
+  [[ "$engine" == "mysql" ]] || die "Unsupported database engine for provisioning: ${engine:-none}"
+
+  db="$(yaml_value "$manifest" database_name || true)"
+  user="$(yaml_value "$manifest" database_user || true)"
+  pass="$(env_value "$env_file" DB_PASSWORD || true)"
+
+  [[ -n "$db" ]] || db="$(default_database_name "$alias")"
+  [[ -n "$user" ]] || user="$(default_database_user "$alias")"
+  [[ -n "$pass" && "$pass" != "password" && "$pass" != "changeme" ]] || pass="$(generate_db_password)"
+
+  safe_db_identifier "$db"
+  safe_db_identifier "$user"
+
+  local pass_sql
+  pass_sql="${pass//\'/\'\'}"
+
+  bold "Provisioning MySQL for $alias.localhost"
+  mysql_admin_exec "CREATE DATABASE IF NOT EXISTS \`$db\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+  mysql_admin_exec "CREATE USER IF NOT EXISTS '$user'@'localhost' IDENTIFIED BY '$pass_sql';"
+  mysql_admin_exec "ALTER USER '$user'@'localhost' IDENTIFIED BY '$pass_sql';"
+  mysql_admin_exec "GRANT ALL PRIVILEGES ON \`$db\`.* TO '$user'@'localhost'; FLUSH PRIVILEGES;"
+
+  touch "$env_file"
+  env_set "$env_file" DB_HOST 127.0.0.1
+  env_set "$env_file" DB_PORT 3306
+  env_set "$env_file" DB_DATABASE "$db"
+  env_set "$env_file" DB_USERNAME "$user"
+  env_set "$env_file" DB_PASSWORD "$pass"
+
+  yaml_set "$manifest" database_engine mysql
+  yaml_set "$manifest" database_name "$db"
+  yaml_set "$manifest" database_user "$user"
+
+  if mysql_app_query "$project" "SELECT 1;" >/dev/null 2>&1; then
+    ok "Application database credentials verified"
+  else
+    die "Database was provisioned, but application credential verification failed."
+  fi
+
+  ensure_mysql_local_trigger_policy || warn "Database ready, but trigger/function migration policy still needs admin configuration."
+
+  ok "Database ready: $db"
+  echo "Credentials written to $env_file"
+}
+
+cmd_db_migrate() {
+  [[ $# -eq 1 ]] || die "Usage: tembeek-local db migrate <alias>"
+  local alias project command
+  alias="$(normalize_alias "$1")"
+  validate_alias "$alias"
+  project="$(resolve_project_root "$alias")" || die "Alias does not exist: $alias"
+
+  if ! mysql_app_query "$project" "SELECT 1;" >/dev/null 2>&1; then
+    die "Application database is not reachable. Run: tembeek-local db create $alias"
+  fi
+
+  command="$(detect_migration_command "$project")"
+  [[ "$command" != "none" ]] || die "No migration command declared or detected."
+
+  ensure_mysql_local_trigger_policy || return 1
+
+  bold "Running migrations for $alias.localhost"
+  echo "Command: $command"
+  (cd "$project" && bash -lc "$command")
+  ok "Migration command completed"
+
+  cmd_db_status "$alias"
+}
+
+list_local_migration_files() {
+  local project="$1" mdir="$2"
+  [[ "$mdir" != "none" && -d "$project/$mdir" ]] || return 0
+  find "$project/$mdir" -maxdepth 1 -type f \( -name '*.sql' -o -name '*.php' \) -print \
+    | sed 's#.*/##' \
+    | sort
+}
+
+detect_migration_ledger() {
+  local project="$1"
+  local table col
+
+  for table in schema_migrations migrations; do
+    local exists
+    exists="$(mysql_app_query "$project" "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='$table';" 2>/dev/null || true)"
+    [[ "$exists" == "1" ]] || continue
+
+    for col in migration version filename name; do
+      local c
+      c="$(mysql_app_query "$project" "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema=DATABASE() AND table_name='$table' AND column_name='$col';" 2>/dev/null || true)"
+      if [[ "$c" == "1" ]]; then
+        printf '%s|%s' "$table" "$col"
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+migration_value_matches_file() {
+  local value="$1" file="$2"
+  local stem="${file%.*}"
+  [[ "$value" == "$file" || "$value" == "$stem" ]]
+}
+
+cmd_db_status() {
+  [[ $# -eq 1 ]] || die "Usage: tembeek-local db status <alias>"
+  require_cmd mysql || die "mysql client is required."
+
+  local alias project manifest env_file db user
+  alias="$(normalize_alias "$1")"
+  validate_alias "$alias"
+  project="$(resolve_project_root "$alias")" || die "Alias does not exist: $alias"
+  manifest="$project/.tembeek/local.yaml"
+  env_file="$project/.env"
+
+  bold "Database status: $alias.localhost"
+
+  [[ -f "$env_file" ]] || die ".env missing: $env_file"
+
+  db="$(env_value "$env_file" DB_DATABASE || true)"
+  user="$(env_value "$env_file" DB_USERNAME || true)"
+  echo "Database: ${db:-not configured}"
+  echo "User:     ${user:-not configured}"
+
+  if mysql_app_query "$project" "SELECT 1;" >/dev/null 2>&1; then
+    ok "Database connection"
+  else
+    fail "Database connection"
+    return 1
+  fi
+
+  local mdir command
+  mdir="$(detect_migration_dir "$project")"
+  command="$(detect_migration_command "$project")"
+
+  [[ "$mdir" != "none" ]] && ok "Migration directory: $mdir" || warn "No migration directory detected"
+  [[ "$command" != "none" ]] && ok "Migration command: $command" || warn "No migration command detected"
+
+  local ledger=""
+  ledger="$(detect_migration_ledger "$project" || true)"
+  if [[ -z "$ledger" ]]; then
+    warn "No compatible migration ledger detected; drift cannot be proven generically"
+    return 0
+  fi
+
+  local table="${ledger%%|*}"
+  local col="${ledger##*|}"
+  ok "Migration ledger: $table.$col"
+
+  local applied
+  applied="$(mysql_app_query "$project" "SELECT \`$col\` FROM \`$table\` ORDER BY \`$col\`;" 2>/dev/null || true)"
+
+  local total=0 pending=0 file found value
+  while IFS= read -r file; do
+    [[ -n "$file" ]] || continue
+    total=$((total+1))
+    found=0
+    while IFS= read -r value; do
+      [[ -n "$value" ]] || continue
+      if migration_value_matches_file "$value" "$file"; then
+        found=1
+        break
+      fi
+    done <<<"$applied"
+    if [[ "$found" -eq 0 ]]; then
+      pending=$((pending+1))
+      echo "PENDING: $file"
+    fi
+  done < <(list_local_migration_files "$project" "$mdir")
+
+  if [[ "$total" -eq 0 ]]; then
+    warn "No migration files found"
+  elif [[ "$pending" -eq 0 ]]; then
+    ok "Migration files appear current ($total checked)"
+  else
+    fail "$pending of $total migration file(s) appear unapplied"
+    return 1
+  fi
+}
+
+cmd_db() {
+  local action="${1:-}"
+  shift || true
+  case "$action" in
+    create)  cmd_db_create "$@" ;;
+    migrate) cmd_db_migrate "$@" ;;
+    status)  cmd_db_status "$@" ;;
+    "") die "Usage: tembeek-local db <create|migrate|status> <alias>" ;;
+    *) die "Unknown db action: $action" ;;
+  esac
+}
+
+database_doctor_checks() {
+  local alias="$1"
+  local project
+  project="$(resolve_project_root "$alias" 2>/dev/null || true)"
+  [[ -n "$project" ]] || return 0
+  local manifest="$project/.tembeek/local.yaml"
+  [[ -f "$manifest" ]] || return 0
+
+  local engine
+  engine="$(yaml_value "$manifest" database_engine 2>/dev/null || true)"
+  if [[ -z "$engine" || "$engine" == "none" ]]; then
+    ok "Database not required by manifest"
+    return 0
+  fi
+
+  if [[ "$engine" != "mysql" ]]; then
+    warn "Database engine '$engine' is not yet supported by tembeek-local provisioning"
+    return 0
+  fi
+
+  if ! require_cmd mysql; then
+    fail "mysql client missing"
+    return 1
+  fi
+
+  if mysql_app_query "$project" "SELECT 1;" >/dev/null 2>&1; then
+    ok "Application database reachable"
+    if ! mysql_compatible_service_detected; then
+      ok "MySQL-compatible runtime confirmed through project database connectivity"
+    fi
+
+  else
+    fail "Application database unreachable"
+    return 1
+  fi
+
+  local mdir
+  mdir="$(detect_migration_dir "$project")"
+  if [[ "$mdir" != "none" ]]; then
+    local ledger
+    ledger="$(detect_migration_ledger "$project" || true)"
+    [[ -n "$ledger" ]] \
+      && ok "Migration ledger detectable: ${ledger/|/.}" \
+      || warn "Migration directory exists but no generic ledger is detectable"
+  fi
+}
+
+
+
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
+
+emit_json_result() {
+  local scope="$1" alias="$2" status="$3" failures="$4" warnings="$5" strict="$6" checks_json="$7"
+  printf '{"tool":"tembeek-local","version":"%s","scope":"%s","alias":"%s","status":"%s","strict_warnings":%s,"failures":%s,"warnings":%s,"checks":%s}\n' \
+    "$(json_escape "$VERSION")" "$(json_escape "$scope")" "$(json_escape "$alias")" \
+    "$(json_escape "$status")" "$strict" "$failures" "$warnings" "$checks_json"
+}
+
+strip_ansi() {
+  sed $'s/\033\\[[0-9;]*m//g'
+}
+
+count_warning_lines() {
+  local text="$1"
+  [[ -n "$text" ]] || { echo 0; return; }
+  printf '%s\n' "$text" | strip_ansi | grep -Ec '^! ' || true
+}
+
+json_check_obj() {
+  local id="$1" status="$2" message="$3"
+  printf '{"id":"%s","status":"%s","message":"%s"}' \
+    "$(json_escape "$id")" "$(json_escape "$status")" "$(json_escape "$message")"
+}
+
+hosting_checks_json() {
+  local project="$1" items=()
+  local ps es
+  ps="$(policy_php_status "$project")"
+  es="$(policy_required_extensions_status "$project")"
+  items+=("$(json_check_obj php_version "$ps" "Production PHP target: $(effective_php_target "$project")")")
+  items+=("$(json_check_obj required_extensions "$es" "Manifest-required PHP extensions")")
+
+  local collisions
+  collisions="$(collect_project_files "$project" | sed "s#^$project/##" | awk '{print tolower($0)}' | sort | uniq -d)"
+  if [[ -z "$collisions" ]]; then items+=("$(json_check_obj case_collisions pass "No case-insensitive filename collisions")")
+  elif is_policy_exception "$project" case_collisions; then items+=("$(json_check_obj case_collisions warn "Filename collisions detected (policy exception)")")
+  else items+=("$(json_check_obj case_collisions fail "Case-insensitive filename collisions detected")"); fi
+
+  local abs
+  abs="$(grep -RInE --exclude-dir=.git --exclude-dir=.venv --exclude-dir=venv --exclude-dir=node_modules --exclude-dir=vendor --exclude-dir=.idea --exclude-dir=.vscode --exclude-dir=.pytest_cache --exclude-dir=.mypy_cache --exclude-dir=.ruff_cache --exclude-dir=__pycache__ --exclude-dir=coverage --exclude-dir=dist --exclude-dir=build --exclude-dir=.git --exclude-dir=vendor --exclude-dir=node_modules '(/Users/[^/[:space:]]+|/home/[^/[:space:]]+|[A-Za-z]:\\\\Users\\\\)' "$project" 2>/dev/null || true)"
+  if [[ -z "$abs" ]]; then items+=("$(json_check_obj absolute_paths pass "No hard-coded developer filesystem paths")")
+  elif is_policy_exception "$project" absolute_paths; then items+=("$(json_check_obj absolute_paths warn "Hard-coded developer paths detected (policy exception)")")
+  else items+=("$(json_check_obj absolute_paths fail "Hard-coded developer filesystem paths detected")"); fi
+
+  local localrefs
+  localrefs="$(grep -RInE --exclude-dir=.git --exclude-dir=.venv --exclude-dir=venv --exclude-dir=node_modules --exclude-dir=vendor --exclude-dir=.idea --exclude-dir=.vscode --exclude-dir=.pytest_cache --exclude-dir=.mypy_cache --exclude-dir=.ruff_cache --exclude-dir=__pycache__ --exclude-dir=coverage --exclude-dir=dist --exclude-dir=build --exclude-dir=.git --exclude-dir=vendor --exclude-dir=node_modules --exclude='.env' --exclude='.env.example' --exclude='local.yaml' '(https?://[^[:space:]"\047]*localhost|127\.0\.0\.1)' "$project" 2>/dev/null || true)"
+  [[ -z "$localrefs" ]] && items+=("$(json_check_obj localhost_leakage pass "No localhost leakage outside local config")") || items+=("$(json_check_obj localhost_leakage warn "Hard-coded localhost or 127.0.0.1 detected")")
+
+  local links disallowed="" link rel
+  links="$(scan_find_symlinks "$project" 2>/dev/null || true)"
+  while IFS= read -r link; do
+    [[ -n "$link" ]] || continue
+    rel="${link#"$project"/}"
+    policy_allowed_symlinks "$project" | grep -Fxq "$rel" || disallowed+="$rel"$'\n'
+  done <<<"$links"
+  if [[ -z "$links" ]]; then items+=("$(json_check_obj symlinks pass "No repository symlinks")")
+  elif [[ -z "$disallowed" ]]; then items+=("$(json_check_obj symlinks pass "All repository symlinks are policy-allowed")")
+  else items+=("$(json_check_obj symlinks warn "Repository contains non-allowlisted symlinks")"); fi
+
+  local procdeps line token matched all_allowed=true
+  procdeps="$(grep -RInE --exclude-dir=.git --exclude-dir=.venv --exclude-dir=venv --exclude-dir=node_modules --exclude-dir=vendor --exclude-dir=.idea --exclude-dir=.vscode --exclude-dir=.pytest_cache --exclude-dir=.mypy_cache --exclude-dir=.ruff_cache --exclude-dir=__pycache__ --exclude-dir=coverage --exclude-dir=dist --exclude-dir=build --include='*.php' --exclude-dir=vendor --exclude-dir=.git '(shell_exec\s*\(|exec\s*\(|system\s*\(|passthru\s*\(|proc_open\s*\(|popen\s*\(|pcntl_|posix_|supervisor|systemd|daemon)' "$project" 2>/dev/null || true)"
+  if [[ -z "$procdeps" ]]; then items+=("$(json_check_obj process_dependencies pass "No obvious shell or daemon dependency")")
+  else
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      matched=false
+      while IFS= read -r token; do [[ -n "$token" ]] || continue; grep -Fq "$token" <<<"$line" && { matched=true; break; }; done < <(policy_allowed_process_dependencies "$project")
+      [[ "$matched" == true ]] || { all_allowed=false; break; }
+    done <<<"$procdeps"
+    [[ "$all_allowed" == true ]] && items+=("$(json_check_obj process_dependencies pass "Detected process dependencies are policy-allowed")") || items+=("$(json_check_obj process_dependencies warn "Possible non-allowlisted process dependency detected")")
+  fi
+
+  if [[ ! -f "$project/.env" ]]; then items+=("$(json_check_obj env_gitignore warn ".env does not exist")")
+  elif [[ -f "$project/.gitignore" ]] && grep -Eq '(^|/)\.env($|[[:space:]])' "$project/.gitignore"; then items+=("$(json_check_obj env_gitignore pass ".env appears excluded by .gitignore")")
+  else items+=("$(json_check_obj env_gitignore warn ".env may not be excluded by .gitignore")"); fi
+
+  printf '['
+  local i
+  for ((i=0; i<${#items[@]}; i++)); do [[ $i -gt 0 ]] && printf ','; printf '%s' "${items[$i]}"; done
+  printf ']'
+}
+
+
+db_checks_json() {
+  local project="$1"
+  local engine
+  engine="$(yaml_value "$project/.tembeek/local.yaml" database_engine 2>/dev/null || true)"
+  if [[ -z "$engine" || "$engine" == "none" ]]; then
+    printf '[%s]' "$(json_check_obj database not_applicable "Database not required")"
+  elif [[ "$engine" != "mysql" ]]; then
+    printf '[%s]' "$(json_check_obj database warn "Unsupported database engine: $engine")"
+  elif mysql_app_query "$project" "SELECT 1;" >/dev/null 2>&1; then
+    printf '[%s]' "$(json_check_obj database pass "Application database reachable")"
+  else
+    printf '[%s]' "$(json_check_obj database fail "Application database unreachable")"
+  fi
+}
+
+
+yaml_bool() {
+  local file="$1" key="$2" default_value="${3:-false}" v
+  v="$(yaml_value "$file" "$key" 2>/dev/null || true)"
+  v="$(printf '%s' "$v" | tr '[:upper:]' '[:lower:]')"
+  case "$v" in true|yes|1|on) echo true ;; false|no|0|off) echo false ;; "") echo "$default_value" ;; *) echo "$default_value" ;; esac
+}
+yaml_csv_items() {
+  local file="$1" key="$2" v
+  v="$(yaml_value "$file" "$key" 2>/dev/null || true)"
+  [[ -n "$v" ]] || return 0
+  v="${v#[}"; v="${v%]}"
+  printf '%s\n' "$v" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^"//;s/"$//' | sed '/^$/d'
+}
+policy_strict_default() { yaml_bool "$1/.tembeek/local.yaml" strict_warnings false; }
+effective_php_target() {
+  local project="$1" v
+  v="$(yaml_value "$project/.tembeek/local.yaml" production_php_version 2>/dev/null || true)"
+  [[ -n "$v" ]] || v="$(yaml_value "$project/.tembeek/local.yaml" php_version 2>/dev/null || true)"
+  [[ -n "$v" ]] || v="8.4"
+  echo "$v"
+}
+policy_required_extensions() { yaml_csv_items "$1/.tembeek/local.yaml" required_extensions; }
+policy_allowed_symlinks() { yaml_csv_items "$1/.tembeek/local.yaml" allowed_symlinks; }
+policy_allowed_process_dependencies() { yaml_csv_items "$1/.tembeek/local.yaml" allowed_process_dependencies; }
+policy_exceptions() { yaml_csv_items "$1/.tembeek/local.yaml" policy_exceptions; }
+is_policy_exception() { policy_exceptions "$1" | grep -Fxq "$2"; }
+policy_summary_json() {
+  printf '{"strict_warnings_default":%s,"production_php_version":"%s"}' \
+    "$(policy_strict_default "$1")" "$(json_escape "$(effective_php_target "$1")")"
+}
+policy_php_status() {
+  local p="$1" expected actual
+  expected="$(effective_php_target "$p")"
+  actual="$("$(active_php_bin)" -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true)"
+  if [[ "$actual" == "$expected" ]]; then echo pass
+  elif is_policy_exception "$p" php_version; then echo warn
+  else echo fail; fi
+}
+policy_required_extensions_status() {
+  local p="$1" ext
+  while IFS= read -r ext; do
+    [[ -n "$ext" ]] || continue
+    if ! php_extension_loaded "$ext"; then
+      if is_policy_exception "$p" required_extensions; then echo warn; else echo fail; fi
+      return
+    fi
+  done < <(policy_required_extensions "$p")
+  echo pass
+}
+
+collect_project_files() {
+  local project="$1"
+  find "$project" \
+    \( -path "$project/.git" -o -path "$project/vendor" -o -path "$project/node_modules" \) -prune -o \
+    -type f -print
+}
+
+check_php_version_compat() {
+  local project="$1"
+  local manifest="$project/.tembeek/local.yaml"
+  local expected
+  expected="$(yaml_value "$manifest" "php_version" 2>/dev/null || true)"
+  [[ -n "$expected" ]] || expected="8.4"
+
+  local actual
+  actual="$("$(active_php_bin)" -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true)"
+  if [[ "$actual" == "$expected" ]]; then
+    ok "PHP runtime matches declared version: $expected"
+    return 0
+  else
+    fail "PHP runtime $actual differs from declared $expected"
+    return 1
+  fi
+}
+
+check_sensitive_files() {
+  local project="$1" docroot="$2"
+  local failures=0
+  local f
+  for f in .env .git/config composer.json composer.lock phpunit.xml phpunit.xml.dist .htaccess; do
+    if [[ -e "$docroot/$f" ]]; then
+      case "$f" in
+        .htaccess) : ;;
+        .env|.git/config|phpunit.xml|phpunit.xml.dist)
+          warn "Sensitive/internal file exists under document root: $f"
+          ;;
+        composer.json|composer.lock)
+          warn "Composer metadata is web-root visible unless blocked by .htaccess: $f"
+          ;;
+      esac
+    fi
+  done
+  return "$failures"
+}
+
+
+scan_prune_find_args() {
+  # Generated/dependency/runtime trees must not affect source portability checks.
+  # Print tokens suitable for eval/set -- use via scan_find_files helper below.
+  printf '%s\n' \
+    '.git' \
+    '.venv' \
+    'venv' \
+    'node_modules' \
+    'vendor' \
+    '.idea' \
+    '.vscode' \
+    '.pytest_cache' \
+    '.mypy_cache' \
+    '.ruff_cache' \
+    '__pycache__' \
+    'coverage' \
+    '.coverage' \
+    'dist' \
+    'build' \
+    'storage/cache' \
+    '.phpstan.cache' \
+    '.phpunit.cache'
+}
+
+scan_find_files() {
+  local project="$1"
+  shift || true
+
+  find "$project" \
+    \( \
+      -type d \( \
+        -name .git -o \
+        -name .venv -o \
+        -name venv -o \
+        -name node_modules -o \
+        -name vendor -o \
+        -name .idea -o \
+        -name .vscode -o \
+        -name .pytest_cache -o \
+        -name .mypy_cache -o \
+        -name .ruff_cache -o \
+        -name __pycache__ -o \
+        -name coverage -o \
+        -name dist -o \
+        -name build -o \
+        -path '*/storage/cache' -o \
+        -path '*/storage/backups' \
+      \) \
+    \) -prune -o \
+    -type f "$@" -print
+}
+
+scan_find_symlinks() {
+  local project="$1"
+  find "$project" \
+    \( \
+      -type d \( \
+        -name .git -o \
+        -name .venv -o \
+        -name venv -o \
+        -name node_modules -o \
+        -name vendor -o \
+        -name .idea -o \
+        -name .vscode -o \
+        -name .pytest_cache -o \
+        -name .mypy_cache -o \
+        -name .ruff_cache -o \
+        -name __pycache__ -o \
+        -name coverage -o \
+        -name dist -o \
+        -name build -o \
+        -path '*/storage/cache' -o \
+        -path '*/storage/backups' \
+      \) \
+    \) -prune -o \
+    -type l -print
+}
+
+
+path_is_generated_or_local_only() {
+  local rel="$1"
+  case "$rel" in
+    */storage/cache/*|storage/cache/*|*/storage/backups/*|storage/backups/*|*/.venv/*|.venv/*|*/node_modules/*|node_modules/*|*/vendor/*|vendor/*)
+      return 0 ;;
+    .env|*/.env|.env.*.local|*/.env.*.local|.env.ui.local|*/.env.ui.local|*.env.local|*/.env.local)
+      return 0 ;;
+    *.bak|*/.env*.bak|.env*.example|*/.env*.example)
+      return 0 ;;
+  esac
+  return 1
+}
+
+absolute_path_is_placeholder_example() {
+  local line="$1"
+  case "$line" in
+    *"/home/ACCOUNT/"*|*"/home/USERNAME/"*|*"/Users/USERNAME/"*|*"/Users/YOUR_"*)
+      return 0 ;;
+  esac
+  return 1
+}
+
+path_is_documentation() {
+  local rel="$1"
+  case "$rel" in
+    docs/*|*/docs/*|README*|*/README*|*.md|*.mdx|*.rst)
+      return 0 ;;
+  esac
+  return 1
+}
+
+path_is_dev_or_test_tooling() {
+  local rel="$1"
+  case "$rel" in
+    docs/*|*/docs/*|tests/*|*/tests/*|test/*|*/test/*|.github/*|*/.github/*)
+      return 0 ;;
+    playwright.config.*|*/playwright.config.*|phpunit.xml|phpunit.xml.*|*/phpunit.xml|*/phpunit.xml.*)
+      return 0 ;;
+    bin/dev-*|*/bin/dev-*|bin/phpunit-*|*/bin/phpunit-*|bin/setup-phpunit-*|*/bin/setup-phpunit-*|bin/cleanup-*-local-*|*/bin/cleanup-*-local-*)
+      return 0 ;;
+  esac
+  return 1
+}
+
+check_absolute_paths() {
+  local project="$1"
+  local found=0
+  local line file rel content
+  local matches=""
+
+  while IFS= read -r file; do
+    rel="${file#"$project"/}"
+    path_is_generated_or_local_only "$rel" && continue
+
+    # Binary files are irrelevant to source portability scanning.
+    if ! grep -Iq . "$file" 2>/dev/null; then
+      continue
+    fi
+
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      content="${line#*:}"
+      absolute_path_is_placeholder_example "$content" && continue
+
+      # Documentation examples are not deployment source.
+      if path_is_documentation "$rel"; then
+        continue
+      fi
+
+      matches+="${rel}:${line}"$'\n'
+      found=1
+    done < <(
+      grep -nE '(/Users/[^[:space:]"'\'']+|/home/[^[:space:]"'\'']+|[A-Za-z]:\\\\Users\\\\[^[:space:]"'\'']+)' "$file" 2>/dev/null || true
+    )
+  done < <(scan_find_files "$project")
+
+  if [[ "$found" -eq 0 ]]; then
+    ok "No hard-coded developer filesystem paths"
+    return 0
+  fi
+
+  fail "Hard-coded developer filesystem paths detected"
+  printf '%s' "$matches" | sed 's/^/  /'
+  return 1
+}
+
+check_localhost_leakage() {
+  local project="$1"
+  local found=0 file rel line matches=""
+
+  while IFS= read -r file; do
+    rel="${file#"$project"/}"
+    path_is_generated_or_local_only "$rel" && continue
+    path_is_dev_or_test_tooling "$rel" && continue
+
+    if ! grep -Iq . "$file" 2>/dev/null; then
+      continue
+    fi
+
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+
+      # Environment-overridable local defaults are portable configuration,
+      # not hard-coded deployment endpoints.
+      if [[ "$line" =~ (\$_ENV|\$_SERVER|getenv\(|process\.env\.) ]] && \
+         [[ "$line" =~ (\?\?|\|\|) ]]; then
+        continue
+      fi
+
+      matches+="${rel}:${line}"$'\n'
+      found=1
+    done < <(grep -nE '(localhost|127\.0\.0\.1|::1)' "$file" 2>/dev/null || true)
+  done < <(scan_find_files "$project")
+
+  if [[ "$found" -eq 0 ]]; then
+    ok "No unexpected localhost/127.0.0.1 references in deployable source"
+    return 0
+  fi
+
+  warn "Hard-coded localhost/127.0.0.1 references detected in deployable source"
+  printf '%s' "$matches" | sed 's/^/  /'
+  return 0
+}
+
+check_symlinks() {
+  local project="$1"
+  local links
+  links="$(scan_find_symlinks "$project" 2>/dev/null || true)"
+  if [[ -n "$links" ]]; then
+    warn "Repository contains symlinks; confirm shared hosting preserves them"
+    echo "$links" | head -20 | sed 's/^/  /'
+  else
+    ok "No repository symlinks"
+  fi
+}
+
+check_case_collisions() {
+  local project="$1"
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/tembeek-case.XXXXXX")"
+  collect_project_files "$project" | sed "s#^$project/##" | awk '{print tolower($0)}' | sort | uniq -d > "$tmp"
+  if [[ -s "$tmp" ]]; then
+    fail "Case-insensitive filename collisions detected"
+    sed 's/^/  /' "$tmp"
+    rm -f "$tmp"
+    return 1
+  fi
+  rm -f "$tmp"
+  ok "No case-insensitive filename collisions"
+}
+
+
+path_is_build_install_or_test_tooling() {
+  local rel="$1"
+  path_is_dev_or_test_tooling "$rel" && return 0
+  case "$rel" in
+    bin/install-*|*/bin/install-*|bin/fix-*|*/bin/fix-*|tests/bootstrap/*|*/tests/bootstrap/*)
+      return 0 ;;
+  esac
+  return 1
+}
+
+check_cli_daemon_dependencies() {
+  local project="$1"
+  local found=0 file rel line matches=""
+
+  while IFS= read -r file; do
+    rel="${file#"$project"/}"
+    path_is_generated_or_local_only "$rel" && continue
+    path_is_build_install_or_test_tooling "$rel" && continue
+    [[ "$rel" == *.php || "$rel" == *.sh || "$rel" == bin/* || "$rel" == */bin/* ]] || continue
+
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+
+      # PDO/mysqli method calls named ->exec() are database APIs, not shell execution.
+      if [[ "$line" == *"->exec("* || "$line" == *"->exec ("* ]]; then
+        continue
+      fi
+
+      matches+="${rel}:${line}"$'\n'
+      found=1
+    done < <(
+      grep -nE '(^|[^A-Za-z0-9_])(shell_exec|exec|system|passthru|proc_open|popen|pcntl_[A-Za-z0-9_]*|posix_[A-Za-z0-9_]*)[[:space:]]*\(' "$file" 2>/dev/null || true
+    )
+  done < <(scan_find_files "$project")
+
+  if [[ "$found" -eq 0 ]]; then
+    ok "No unexpected shell/daemon/process-control dependencies in deployable source"
+    return 0
+  fi
+
+  warn "Possible shell/daemon/process-control dependencies detected in deployable source"
+  printf '%s' "$matches" | sed 's/^/  /'
+  return 0
+}
+
+check_php_extensions_from_composer() {
+  local project="$1"
+  [[ -f "$project/composer.json" ]] || { ok "No composer.json extension requirements to check"; return 0; }
+
+  local php_bin exts
+  php_bin="$(active_php_bin)" || { fail "Canonical Homebrew PHP runtime unavailable"; return 1; }
+
+  exts="$("$php_bin" -r '
+    $f=$argv[1];
+    $j=json_decode(file_get_contents($f), true);
+    foreach (($j["require"] ?? []) as $k=>$v) {
+      if (str_starts_with($k, "ext-")) echo substr($k,4), PHP_EOL;
+    }
+  ' "$project/composer.json" 2>/dev/null || true)"
+
+  [[ -n "$exts" ]] || { ok "No explicit Composer PHP extension requirements"; return 0; }
+
+  local failures=0 ext
+  while IFS= read -r ext; do
+    [[ -n "$ext" ]] || continue
+    if php_extension_loaded "$ext"; then
+      ok "PHP extension available: $ext"
+    else
+      fail "Required PHP extension missing locally: $ext"
+      failures=$((failures+1))
+    fi
+  done <<<"$exts"
+  return "$failures"
+}
+
+check_writable_directories() {
+  local project="$1"
+  local found=0 d
+  for d in storage var cache tmp uploads public/uploads; do
+    if [[ -d "$project/$d" ]]; then
+      found=1
+      if [[ -w "$project/$d" ]]; then
+        ok "Writable directory locally: $d"
+      else
+        fail "Expected runtime directory is not writable locally: $d"
+        return 1
+      fi
+    fi
+  done
+  [[ "$found" -eq 1 ]] || ok "No conventional writable runtime directories detected"
+}
+
+check_htaccess_portability() {
+  local docroot="$1"
+  local ht="$docroot/.htaccess"
+  [[ -f "$ht" ]] || { warn "No .htaccess at document root"; return 0; }
+
+  local suspicious
+  suspicious="$(grep -nE '(RewriteBase[[:space:]]+/(.+)|/Users/|/home/|localhost|127\.0\.0\.1)' "$ht" 2>/dev/null || true)"
+  if [[ -n "$suspicious" ]]; then
+    warn "Potentially environment-specific .htaccess directives detected"
+    echo "$suspicious" | sed 's/^/  /'
+  else
+    ok ".htaccess has no obvious local-path/host coupling"
+  fi
+}
+
+check_env_gitignore() {
+  local project="$1"
+  if [[ ! -f "$project/.env" ]]; then
+    warn ".env does not exist"
+    return 0
+  fi
+  if [[ -f "$project/.gitignore" ]] && grep -Eq '(^|/)\.env($|[[:space:]])' "$project/.gitignore"; then
+    ok ".env appears excluded by .gitignore"
+  else
+    warn ".env may not be excluded by .gitignore"
+  fi
+}
+
+
+policy_known_keys() {
+cat <<'EOF'
+schema_version
+project
+type
+alias
+document_root
+php_version
+hosting_profile
+production_php_version
+strict_warnings
+required_extensions
+allowed_symlinks
+allowed_process_dependencies
+policy_exceptions
+database_engine
+database_name
+database_user
+migration_dir
+migration_command
+EOF
+}
+policy_known_check_ids() {
+cat <<'EOF'
+php_version
+required_extensions
+case_collisions
+absolute_paths
+localhost_leakage
+symlinks
+process_dependencies
+env_gitignore
+database
+EOF
+}
+policy_manifest_keys() {
+  awk '/^[[:space:]]*#/||/^[[:space:]]*$/ {next} /^[^[:space:]#][^:]*:/ {k=$0; sub(/:.*/,"",k); gsub(/[[:space:]]+$/,"",k); print k}' "$1"
+}
+policy_validate_manifest() {
+  local project="$1" json="${2:-0}" manifest="$1/.tembeek/local.yaml"
+  local failures=0 warnings=0 checks=()
+  [[ -f "$manifest" ]] || { [[ "$json" -eq 1 ]] && echo '{"status":"fail","failures":1,"warnings":0,"checks":[]}' || fail "Manifest missing: $manifest"; return 1; }
+
+  local schema
+  schema="$(yaml_value "$manifest" schema_version 2>/dev/null || true)"
+  if [[ "$schema" == "1" ]]; then checks+=("$(json_check_obj schema_version pass "schema_version 1")")
+  elif [[ -z "$schema" ]]; then warnings=$((warnings+1)); checks+=("$(json_check_obj schema_version warn "schema_version missing; legacy v0")"); [[ "$json" -eq 0 ]] && warn "schema_version missing; legacy v0"
+  else failures=$((failures+1)); checks+=("$(json_check_obj schema_version fail "Unsupported schema_version: $schema")"); [[ "$json" -eq 0 ]] && fail "Unsupported schema_version: $schema"; fi
+
+  local k unknown=0
+  while IFS= read -r k; do
+    policy_known_keys | grep -Fxq "$k" || { unknown=$((unknown+1)); [[ "$json" -eq 0 ]] && fail "Unknown manifest key: $k"; }
+  done < <(policy_manifest_keys "$manifest")
+  [[ "$unknown" -eq 0 ]] && checks+=("$(json_check_obj unknown_keys pass "No unknown manifest keys")") || { failures=$((failures+1)); checks+=("$(json_check_obj unknown_keys fail "$unknown unknown key(s)")"); }
+
+  local type alias docroot strict phpv engine exc bad=0
+  type="$(yaml_value "$manifest" type || true)"
+  alias="$(yaml_value "$manifest" alias || true)"
+  docroot="$(yaml_value "$manifest" document_root || true)"
+  strict="$(yaml_value "$manifest" strict_warnings || true)"
+  phpv="$(yaml_value "$manifest" production_php_version || true)"
+  engine="$(yaml_value "$manifest" database_engine || true)"
+
+  [[ "$type" == "php" ]] && checks+=("$(json_check_obj type pass "type is php")") || { failures=$((failures+1)); checks+=("$(json_check_obj type fail "type must be php")"); }
+  [[ "$alias" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] && checks+=("$(json_check_obj alias pass "alias valid")") || { failures=$((failures+1)); checks+=("$(json_check_obj alias fail "alias invalid")"); }
+  [[ "$docroot" == "." || -d "$project/$docroot" ]] && checks+=("$(json_check_obj document_root pass "document_root valid")") || { failures=$((failures+1)); checks+=("$(json_check_obj document_root fail "document_root missing")"); }
+  [[ -z "$phpv" || "$phpv" =~ ^[0-9]+\.[0-9]+$ ]] && checks+=("$(json_check_obj production_php_version pass "PHP target format valid")") || { failures=$((failures+1)); checks+=("$(json_check_obj production_php_version fail "Invalid PHP target")"); }
+  case "${strict,,}" in ""|true|false|yes|no|1|0|on|off) checks+=("$(json_check_obj strict_warnings pass "strict_warnings valid")");; *) failures=$((failures+1)); checks+=("$(json_check_obj strict_warnings fail "strict_warnings invalid")");; esac
+  case "$engine" in ""|none|mysql) checks+=("$(json_check_obj database_engine pass "database_engine valid")");; *) failures=$((failures+1)); checks+=("$(json_check_obj database_engine fail "database_engine unsupported")");; esac
+
+  while IFS= read -r exc; do [[ -n "$exc" ]] || continue; policy_known_check_ids | grep -Fxq "$exc" || bad=$((bad+1)); done < <(policy_exceptions "$project")
+  [[ "$bad" -eq 0 ]] && checks+=("$(json_check_obj policy_exceptions pass "Exception IDs valid")") || { failures=$((failures+1)); checks+=("$(json_check_obj policy_exceptions fail "$bad invalid exception ID(s)")"); }
+
+  if [[ "$json" -eq 1 ]]; then
+    local status=pass i; [[ "$failures" -gt 0 ]] && status=fail
+    printf '{"status":"%s","failures":%s,"warnings":%s,"checks":[' "$status" "$failures" "$warnings"
+    for ((i=0;i<${#checks[@]};i++)); do [[ $i -gt 0 ]] && printf ','; printf '%s' "${checks[$i]}"; done
+    printf ']}\n'
+  else
+    [[ "$failures" -eq 0 ]] && green "Policy validation: PASS" || red "Policy validation: FAIL"
+  fi
+  [[ "$failures" -eq 0 ]]
+}
+cmd_policy_validate() {
+  local alias="" json=0
+  while [[ $# -gt 0 ]]; do case "$1" in --json) json=1;; *) alias="$1";; esac; shift; done
+  [[ -n "$alias" ]] || die "Usage: tembeek-local policy validate <alias> [--json]"
+  local project; project="$(resolve_project_root "$(normalize_alias "$alias")")" || die "Alias does not exist: $alias"
+  policy_validate_manifest "$project" "$json"
+}
+cmd_policy_migrate() {
+  [[ $# -eq 1 ]] || die "Usage: tembeek-local policy migrate <alias>"
+  local alias project manifest schema backup tmp
+  alias="$(normalize_alias "$1")"; project="$(resolve_project_root "$alias")" || die "Alias does not exist: $alias"
+  manifest="$project/.tembeek/local.yaml"; [[ -f "$manifest" ]] || die "Manifest missing"
+  schema="$(yaml_value "$manifest" schema_version 2>/dev/null || true)"
+  [[ "$schema" == "1" ]] && { ok "Manifest already schema_version 1"; return 0; }
+  [[ -z "$schema" || "$schema" == "0" ]] || die "Unsupported schema_version: $schema"
+  backup="${manifest}.pre-v1.$(timestamp).bak"; cp -p "$manifest" "$backup"
+  tmp="$(mktemp)"; { echo "schema_version: 1"; cat "$manifest"; } > "$tmp"; mv "$tmp" "$manifest"
+  [[ -n "$(yaml_value "$manifest" production_php_version 2>/dev/null || true)" ]] || yaml_set "$manifest" production_php_version "\"$(yaml_value "$manifest" php_version 2>/dev/null || echo 8.4)\""
+  [[ -n "$(yaml_value "$manifest" strict_warnings 2>/dev/null || true)" ]] || yaml_set "$manifest" strict_warnings false
+  for k in required_extensions allowed_symlinks allowed_process_dependencies policy_exceptions; do [[ -n "$(yaml_value "$manifest" "$k" 2>/dev/null || true)" ]] || yaml_set "$manifest" "$k" "[]"; done
+  if policy_validate_manifest "$project" 0; then ok "Migrated manifest to schema_version 1"; echo "Backup: $backup"; else cp -p "$backup" "$manifest"; die "Migration invalid; original restored"; fi
+}
+cmd_policy() {
+  local a="${1:-}"; shift || true
+  case "$a" in validate) cmd_policy_validate "$@";; migrate) cmd_policy_migrate "$@";; *) die "Usage: tembeek-local policy <validate|migrate> <alias>";; esac
+}
+
+cmd_check_hosting_human() {
+  [[ $# -eq 1 ]] || die "Usage: tembeek-local check hosting <alias>"
+  local alias project docroot failures=0
+  alias="$(normalize_alias "$1")"; validate_alias "$alias"
+  project="$(resolve_project_root "$alias")" || die "Alias does not exist: $alias"
+  docroot="$(detect_document_root "$project")"
+
+  bold "Shared-hosting compatibility: $alias.localhost"
+  echo "Project:       $project"
+  echo "Document root: $docroot"
+  echo
+
+  case "$(policy_php_status "$project")" in
+    pass) ok "PHP runtime matches production target: $(effective_php_target "$project")" ;;
+    warn) warn "PHP runtime differs from production target (policy exception)" ;;
+    fail) fail "PHP runtime differs from production target: $(effective_php_target "$project")"; failures=$((failures+1)) ;;
+  esac
+
+  case "$(policy_required_extensions_status "$project")" in
+    pass) ok "Manifest-required PHP extensions are available" ;;
+    warn) warn "Manifest-required PHP extension missing (policy exception)" ;;
+    fail) fail "Manifest-required PHP extension missing"; failures=$((failures+1)) ;;
+  esac
+
+  check_php_extensions_from_composer "$project" || failures=$((failures+1))
+
+  if ! check_case_collisions "$project"; then
+    if is_policy_exception "$project" case_collisions; then warn "case_collisions is excepted by project policy"; else failures=$((failures+1)); fi
+  fi
+  if ! check_absolute_paths "$project"; then
+    if is_policy_exception "$project" absolute_paths; then warn "absolute_paths is excepted by project policy"; else failures=$((failures+1)); fi
+  fi
+
+  check_localhost_leakage "$project"
+  check_symlinks "$project"
+  check_cli_daemon_dependencies "$project"
+  check_writable_directories "$project" || failures=$((failures+1))
+  check_sensitive_files "$project" "$docroot"
+  check_htaccess_portability "$docroot"
+  check_env_gitignore "$project"
+
+  echo
+  if [[ "$failures" -eq 0 ]]; then
+    green "Hosting check result: PASS with possible warnings above"
+    return 0
+  else
+    red "Hosting check result: FAIL ($failures blocking issue(s))"
+    return 1
+  fi
+}
+
+
+cmd_check_hosting() {
+  local json=0 strict_override="" alias=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) json=1 ;;
+      --strict-warnings) strict_override=true ;;
+      --no-strict-warnings) strict_override=false ;;
+      *) [[ -z "$alias" ]] || die "Usage: tembeek-local check hosting <alias> [--json] [--strict-warnings|--no-strict-warnings]"; alias="$1" ;;
+    esac
+    shift
+  done
+  [[ -n "$alias" ]] || die "Usage: tembeek-local check hosting <alias> [--json] [--strict-warnings|--no-strict-warnings]"
+  alias="$(normalize_alias "$alias")"
+
+  local project strict out rc warnings failures status checks policy_json
+  project="$(resolve_project_root "$alias")" || die "Alias does not exist: $alias"
+  strict="${strict_override:-$(policy_strict_default "$project")}"
+  set +e; out="$(cmd_check_hosting_human "$alias" 2>&1)"; rc=$?; set -e
+  warnings="$(count_warning_lines "$out")"
+  failures=0; [[ "$rc" -eq 0 ]] || failures=1
+  if [[ "$strict" == true && "$warnings" -gt 0 ]]; then failures=$((failures+warnings)); rc=1; fi
+  [[ "$rc" -eq 0 ]] && status=pass || status=fail
+
+  if [[ "$json" -eq 1 ]]; then
+    checks="$(hosting_checks_json "$project")"; policy_json="$(policy_summary_json "$project")"
+    printf '{"tool":"tembeek-local","version":"%s","scope":"hosting","alias":"%s","status":"%s","strict_warnings":%s,"failures":%s,"warnings":%s,"policy":%s,"checks":%s}\n' \
+      "$(json_escape "$VERSION")" "$(json_escape "$alias")" "$status" "$strict" "$failures" "$warnings" "$policy_json" "$checks"
+  else
+    printf '%s\n' "$out"
+    echo "Policy: production_php=$(effective_php_target "$project"), strict_warnings=$strict"
+  fi
+  return "$rc"
+}
+
+cmd_check_all() {
+  local json=0 strict_override="" alias=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) json=1 ;;
+      --strict-warnings) strict_override=true ;;
+      --no-strict-warnings) strict_override=false ;;
+      *) [[ -z "$alias" ]] || die "Usage: tembeek-local check all <alias> [--json] [--strict-warnings|--no-strict-warnings]"; alias="$1" ;;
+    esac
+    shift
+  done
+  [[ -n "$alias" ]] || die "Usage: tembeek-local check all <alias> [--json] [--strict-warnings|--no-strict-warnings]"
+  alias="$(normalize_alias "$alias")"; validate_alias "$alias"
+
+  local project manifest engine strict
+  project="$(resolve_project_root "$alias")" || die "Alias does not exist: $alias"
+  manifest="$project/.tembeek/local.yaml"; engine="$(yaml_value "$manifest" database_engine 2>/dev/null || true)"
+  strict="${strict_override:-$(policy_strict_default "$project")}"
+
+  local hosting_out hosting_rc db_out="" db_rc=0
+  set +e; hosting_out="$(cmd_check_hosting_human "$alias" 2>&1)"; hosting_rc=$?; set -e
+  if [[ -n "$engine" && "$engine" != none ]]; then set +e; db_out="$(cmd_db_status "$alias" 2>&1)"; db_rc=$?; set -e; fi
+
+  local warnings failures=0 rc=0 status=pass
+  warnings="$(count_warning_lines "$hosting_out")"; [[ -n "$db_out" ]] && warnings=$((warnings + $(count_warning_lines "$db_out")))
+  [[ "$hosting_rc" -eq 0 ]] || failures=$((failures+1)); [[ "$db_rc" -eq 0 ]] || failures=$((failures+1))
+  [[ "$strict" == true && "$warnings" -gt 0 ]] && failures=$((failures+warnings))
+  [[ "$failures" -gt 0 ]] && { rc=1; status=fail; }
+
+  if [[ "$json" -eq 1 ]]; then
+    local hjson djson combined policy_json
+    hjson="$(hosting_checks_json "$project")"; djson="$(db_checks_json "$project")"; policy_json="$(policy_summary_json "$project")"
+    combined="{\"hosting\":$hjson,\"database\":$djson}"
+    printf '{"tool":"tembeek-local","version":"%s","scope":"all","alias":"%s","status":"%s","strict_warnings":%s,"failures":%s,"warnings":%s,"policy":%s,"checks":%s}\n' \
+      "$(json_escape "$VERSION")" "$(json_escape "$alias")" "$status" "$strict" "$failures" "$warnings" "$policy_json" "$combined"
+  else
+    bold "Tembeek readiness check: $alias.localhost"; echo; printf '%s\n' "$hosting_out"; echo; bold "Database"
+    [[ -z "$engine" || "$engine" == none ]] && ok "Database not required" || printf '%s\n' "$db_out"
+    echo; echo "Policy: production_php=$(effective_php_target "$project"), strict_warnings=$strict"
+    [[ "$rc" -eq 0 ]] && green "Overall readiness: PASS" || red "Overall readiness: FAIL"
+  fi
+  return "$rc"
+}
+
+
+cmd_check() {
+  local target="${1:-}"
+  shift || true
+  case "$target" in
+    hosting) cmd_check_hosting "$@" ;;
+    all)     cmd_check_all "$@" ;;
+    "") die "Usage: tembeek-local check <hosting|all> <alias> [--json] [--strict-warnings|--no-strict-warnings]" ;;
+    *) die "Unknown check target: $target" ;;
+  esac
+}
+
+hosting_doctor_checks() {
+  local alias="$1"
+  echo
+  bold "Shared-hosting"
+  cmd_check_hosting_human "$alias"
+}
+
+cmd_add() {
+  [[ $# -eq 2 ]] || die "Usage: tembeek-local add <alias> <project-path>"
+  local alias project target
+  alias="$(normalize_alias "$1")"
+  validate_alias "$alias"
+
+  project="$(absolute_path "$2")" || die "Project path does not exist: $2"
+  [[ -d "$project" ]] || die "Project path is not a directory: $project"
+
+  target="$(detect_document_root "$project")"
+  [[ -d "$target" ]] || die "Detected document root does not exist: $target"
+
+  register_alias_target "$alias" "$target"
+
+  if [[ -f "$project/.env.example" || -f "$project/.env" ]]; then
+    ensure_env_file "$project" "$alias"
+  fi
+
+  printf 'URL: http://%s.localhost\n' "$alias"
+}
+
+cmd_remove_alias() {
+  [[ $# -eq 1 ]] || die "Usage: tembeek-local remove <alias>"
+  local alias target
+  alias="$(normalize_alias "$1")"
+  validate_alias "$alias"
+  target="$LOCALHOST_ROOT/$alias"
+
+  [[ -L "$target" ]] || die "Alias does not exist: $alias"
+  rm "$target"
+  ok "Removed $alias.localhost"
+}
+
+
+cmd_remove() {
+  [[ $# -ge 1 ]] || die "Usage: tembeek-local remove <alias|network>"
+  if [[ "$1" == "network" ]]; then
+    shift
+    cmd_remove_network "$@"
+  else
+    cmd_remove_alias "$@"
+  fi
+}
+
+cmd_list() {
+  ensure_registry
+  bold "Tembeek local aliases"
+  local found=0
+  shopt -s nullglob
+  for entry in "$LOCALHOST_ROOT"/*; do
+    [[ -L "$entry" ]] || continue
+    found=1
+    local alias dest status
+    alias="$(basename "$entry")"
+    dest="$(readlink "$entry")"
+    if [[ -e "$entry" ]]; then status="OK"; else status="BROKEN"; fi
+    printf '%-28s %-7s %s\n' "${alias}.localhost" "$status" "$dest"
+  done
+  shopt -u nullglob
+  [[ $found -eq 1 ]] || echo "(none)"
+}
+
+cmd_path() {
+  [[ $# -eq 1 ]] || die "Usage: tembeek-local path <alias>"
+  local alias target
+  alias="$(normalize_alias "$1")"
+  target="$LOCALHOST_ROOT/$alias"
+  [[ -L "$target" ]] || die "Alias does not exist: $alias"
+  (cd "$target" && pwd -P)
+}
+
+cmd_url() {
+  [[ $# -eq 1 ]] || die "Usage: tembeek-local url <alias>"
+  local alias
+  alias="$(normalize_alias "$1")"
+  validate_alias "$alias"
+  printf 'http://%s.localhost:%s\n' "$alias" "$HTTP_PORT"
+}
+
+doctor_check_command() {
+  local cmd="$1" label="$2"
+  if require_cmd "$cmd"; then
+    ok "$label: $(command -v "$cmd")"
+    return 0
+  else
+    fail "$label not found"
+    return 1
+  fi
+}
+
+doctor_htaccess_probe() {
+  local probe_alias="tembeek-probe-$$"
+  local probe_dir
+  probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/tembeek-local-probe.XXXXXX")"
+  local probe_link="$LOCALHOST_ROOT/$probe_alias"
+  local url="http://${probe_alias}.localhost:${HTTP_PORT}/probe"
+
+  cat > "$probe_dir/index.php" <<'PHP'
+<?php
+echo ($_GET['htaccess_probe'] ?? '') === 'ok'
+    ? 'TEMBEEK_HTACCESS_OK'
+    : 'TEMBEEK_HTACCESS_MISS';
+PHP
+
+  cat > "$probe_dir/.htaccess" <<'HTACCESS'
+RewriteEngine On
+RewriteRule ^probe/?$ index.php?htaccess_probe=ok [QSA,L]
+HTACCESS
+
+  ln -s "$probe_dir" "$probe_link"
+
+  local body=""
+  if require_cmd curl; then
+    body="$(curl -sS --max-time 4 "$url" 2>/dev/null || true)"
+  fi
+
+  rm -f "$probe_link"
+  rm -rf "$probe_dir"
+
+  if [[ "$body" == "TEMBEEK_HTACCESS_OK" ]]; then
+    ok "End-to-end .htaccess rewrite probe"
+    return 0
+  else
+    fail "End-to-end .htaccess rewrite probe failed"
+    return 1
+  fi
+}
+
+doctor_php_apache_probe() {
+  local probe_alias="tembeek-php-probe-$$"
+  local probe_dir
+  probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/tembeek-local-php-probe.XXXXXX")"
+  local probe_link="$LOCALHOST_ROOT/$probe_alias"
+  local url="http://${probe_alias}.localhost:${HTTP_PORT}/"
+
+  cat > "$probe_dir/index.php" <<'PHP'
+<?php
+echo 'TEMBEEK_PHP:' . PHP_MAJOR_VERSION . '.' . PHP_MINOR_VERSION;
+PHP
+
+  ln -s "$probe_dir" "$probe_link"
+
+  local body=""
+  body="$(curl -sS --max-time 4 "$url" 2>/dev/null || true)"
+
+  rm -f "$probe_link"
+  rm -rf "$probe_dir"
+
+  if [[ "$body" == "TEMBEEK_PHP:8.4" ]]; then
+    ok "Apache executes PHP 8.4 end-to-end"
+    return 0
+  else
+    fail "Apache PHP 8.4 probe failed (received: ${body:-no response})"
+    return 1
+  fi
+}
+
+doctor() {
+  local alias="${1:-}"
+  local failures=0
+
+  bold "Tembeek local doctor"
+  echo
+
+  if doctor_check_command brew "Homebrew"; then
+    local prefix
+    prefix="$(brew_prefix 2>/dev/null || true)"
+    [[ -n "$prefix" ]] && ok "Homebrew prefix: $prefix" || {
+      fail "Unable to determine Homebrew prefix"
+      failures=$((failures+1))
+    }
+  else
+    failures=$((failures+1))
+  fi
+
+  if doctor_check_command httpd "Apache httpd"; then
+    if httpd -t >/tmp/tembeek-local-httpd-test.out 2>&1; then
+      ok "Apache configuration syntax"
+    else
+      fail "Apache configuration syntax"
+      sed 's/^/  /' /tmp/tembeek-local-httpd-test.out
+      failures=$((failures+1))
+    fi
+
+    local modules
+    modules="$(httpd -M 2>/dev/null || true)"
+
+    grep -q 'rewrite_module' <<<"$modules" \
+      && ok "mod_rewrite loaded" \
+      || { fail "mod_rewrite not loaded"; failures=$((failures+1)); }
+
+    grep -q 'vhost_alias_module' <<<"$modules" \
+      && ok "mod_vhost_alias loaded" \
+      || { fail "mod_vhost_alias not loaded"; failures=$((failures+1)); }
+
+    grep -q 'php_module' <<<"$modules" \
+      && ok "PHP Apache module loaded" \
+      || { fail "PHP Apache module not loaded"; failures=$((failures+1)); }
+
+    local mpm_count
+    mpm_count="$(grep -Eo 'mpm_[a-z_]+_module' <<<"$modules" | wc -l | tr -d ' ')"
+    if [[ "$mpm_count" == "1" ]]; then
+      local mpm
+      mpm="$(grep -Eo 'mpm_[a-z_]+_module' <<<"$modules" | head -1)"
+      ok "Exactly one Apache MPM loaded: $mpm"
+      [[ "$mpm" == "mpm_prefork_module" ]] || {
+        fail "mod_php setup expects mpm_prefork_module"
+        failures=$((failures+1))
+      }
+    else
+      fail "Expected exactly one Apache MPM, found $mpm_count"
+      failures=$((failures+1))
+    fi
+  else
+    failures=$((failures+1))
+  fi
+
+  if doctor_check_command php "PHP CLI"; then
+    local php_ver
+    php_ver="$("$(active_php_bin)" -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null || true)"
+    if [[ "$php_ver" == "8.4" ]]; then
+      ok "PHP CLI version: $("$(active_php_bin)" -r 'echo PHP_VERSION;')"
+    else
+      fail "Expected PHP 8.4 CLI, got ${php_ver:-unknown}"
+      failures=$((failures+1))
+    fi
+
+    php_extension_loaded pdo_mysql \
+      && ok "PDO MySQL extension loaded" \
+      || { fail "PDO MySQL extension missing"; failures=$((failures+1)); }
+  else
+    failures=$((failures+1))
+  fi
+
+  if require_cmd brew; then
+    brew list --versions "$PHP_FORMULA" >/dev/null 2>&1 \
+      && ok "Homebrew $PHP_FORMULA installed: $(brew list --versions "$PHP_FORMULA")" \
+      || { fail "Homebrew $PHP_FORMULA is not installed"; failures=$((failures+1)); }
+
+    if mysql_compatible_service_detected; then
+      local mysql_runtime
+      mysql_runtime="$(mysql_runtime_description 2>/dev/null || true)"
+      [[ -n "$mysql_runtime" ]] \
+        && ok "MySQL-compatible runtime detected: $mysql_runtime" \
+        || ok "MySQL-compatible runtime detected"
+    elif [[ -z "$alias" ]]; then
+      warn "No local MySQL/MariaDB server process, service, or conventional listener detected"
+    fi
+  fi
+
+  if [[ -d "$LOCALHOST_ROOT" ]]; then
+    ok "Alias registry exists: $LOCALHOST_ROOT"
+  else
+    fail "Alias registry missing: $LOCALHOST_ROOT"
+    failures=$((failures+1))
+  fi
+
+  if [[ -d "$LOCALHOST_ROOT" ]] && require_cmd curl && require_cmd httpd; then
+    doctor_htaccess_probe || failures=$((failures+1))
+    doctor_php_apache_probe || failures=$((failures+1))
+  else
+    warn "Skipped end-to-end HTTP probes"
+  fi
+
+  echo
+  bold "Network"
+  doctor_network || failures=$((failures+1))
+
+  if [[ -n "$alias" ]]; then
+    alias="$(normalize_alias "$alias")"
+    validate_alias "$alias"
+    local target="$LOCALHOST_ROOT/$alias"
+
+    echo
+    bold "Alias: $alias.localhost"
+
+    if [[ -L "$target" ]]; then
+      ok "Alias symlink exists: $target"
+      if [[ -e "$target" ]]; then
+        ok "Alias target exists: $(cd "$target" && pwd -P)"
+      else
+        fail "Alias symlink is broken -> $(readlink "$target")"
+        failures=$((failures+1))
+      fi
+    else
+      fail "Alias symlink not found: $target"
+      failures=$((failures+1))
+    fi
+
+    if [[ -e "$target/.htaccess" ]]; then
+      ok ".htaccess exists"
+    else
+      warn "No .htaccess found at project root"
+    fi
+
+    project_doctor_checks "$alias" || true
+    database_doctor_checks "$alias" || failures=$((failures+1))
+    hosting_doctor_checks "$alias" || failures=$((failures+1))
+
+    local url="http://${alias}.localhost:${HTTP_PORT}/"
+    if require_cmd curl; then
+      local code
+      code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 4 "$url" 2>/dev/null || true)"
+      if [[ "$code" =~ ^[123][0-9][0-9]$|^401$|^403$|^404$ ]]; then
+        ok "HTTP reachable: $url -> $code"
+      else
+        fail "HTTP check failed: $url -> ${code:-no response}"
+        failures=$((failures+1))
+      fi
+    fi
+  fi
+
+  echo
+  if [[ "$failures" -eq 0 ]]; then
+    green "Doctor result: healthy"
+    return 0
+  else
+    red "Doctor result: $failures problem(s) found"
+    return 1
+  fi
+}
+
+main() {
+  load_machine_config
+  local cmd="${1:-help}"
+  shift || true
+
+  case "$cmd" in
+    setup)       cmd_setup "$@" ;;
+    init)        cmd_init "$@" ;;
+    info)        cmd_info "$@" ;;
+    db)          cmd_db "$@" ;;
+    check)       cmd_check "$@" ;;
+    policy)      cmd_policy "$@" ;;
+    add)         cmd_add "$@" ;;
+    remove|rm)   cmd_remove "$@" ;;
+    list|ls)     cmd_list "$@" ;;
+    doctor)      doctor "$@" ;;
+    path)        cmd_path "$@" ;;
+    url)         cmd_url "$@" ;;
+    version|--version|-v) echo "$VERSION" ;;
+    help|--help|-h) usage ;;
+    *) die "Unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"
