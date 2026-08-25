@@ -2049,3 +2049,186 @@ hotel        -> hotel_dev
 An explicit `database_name` in `.tembeek/local.yaml` always takes precedence.
 
 This default is intentionally local-environment oriented and avoids duplicated product/company prefixes such as `tembeek_tembeek`.
+
+
+## Trusted local HTTPS
+
+Shared workstation setup now provisions trusted local HTTPS with `mkcert`.
+Project setup reconciles `.env` to:
+
+```dotenv
+APP_ENV=local
+APP_URL=https://<alias>.localhost
+```
+
+`.env` remains the generic runtime file because plain PHP projects do not universally
+load `.env.local` or `.env-dev`. Framework-specific layered env files can be added later
+through project policy.
+
+The included `examples/tembeek.com.htaccess` keeps LOCAL and PROD canonicalization separate.
+
+
+## Shell database semantics
+
+A project may be structurally ready for migrations before it has any database-backed product feature.
+
+In the machine project registry:
+
+```json
+{
+  "database": false,
+  "migrate": true
+}
+```
+
+is interpreted as:
+
+```text
+migrate=true
+    -> ensure a local database exists
+    -> provision <alias>_dev when no explicit database_name exists
+    -> run migrations when a migration command exists
+    -> otherwise leave the empty/shell database ready
+```
+
+Therefore `migrate: true` implies a database target. `database: false` suppresses database provisioning only when `migrate` is also false.
+
+This lets a new project start with a harmless local database shell and evolve into DB-backed functionality later without changing bootstrap conventions.
+
+
+## Deterministic local TLS verification
+
+`mkcert -install` trusts the local CA in the macOS trust store. Some `curl` builds use
+their own CA bundle rather than macOS Keychain, so `tembeek-local` does not rely on that
+implementation detail for its health probe.
+
+TLS verification explicitly uses:
+
+```text
+$(mkcert -CAROOT)/rootCA.pem
+```
+
+with `curl --cacert`.
+
+Workstation TLS setup also installs Homebrew `nss` before `mkcert -install`, allowing
+mkcert to update Firefox/NSS trust stores when present.
+
+Network setup checks exclusive ownership of both privileged ports 80 and 443 and emits
+listener/backend/forwarder diagnostics when TLS forwarding cannot be verified.
+
+
+## Local certificate reconciliation
+
+Local TLS setup validates the existing certificate before reuse. The certificate must
+contain SANs for:
+
+```text
+DNS:localhost
+DNS:*.localhost
+IP:127.0.0.1
+IP:::1
+```
+
+If any required SAN is missing, `setup apache` regenerates the certificate with `mkcert`.
+This prevents a trusted-but-hostname-invalid legacy certificate from surviving upgrades.
+
+Network reconciliation also unloads the prior Tembeek launchd/socat forwarder before
+checking/rebinding ports 80 and 443. The Tembeek forwarder error log is cleared at the
+start of a deliberate reconciliation so failure diagnostics describe the current run.
+
+
+## Apache-served certificate verification
+
+A correct certificate file is not enough: Apache must actually serve that certificate.
+
+`setup apache` now compares the SHA-256 fingerprint of the configured mkcert certificate
+against the certificate returned by Apache on the dedicated HTTPS backend port using SNI.
+If they differ, setup fails before network forwarding and prints:
+
+- expected fingerprint;
+- served fingerprint;
+- served certificate SANs;
+- `httpd -S` virtual-host mapping.
+
+The Tembeek HTTPS vhost uses `_default_:<HTTPS_PORT>` because that backend port is reserved
+for `tembeek-local`; this prevents unrelated/default SSL virtual hosts from silently
+serving another certificate.
+
+
+## Explicit project-host TLS SANs
+
+Infrastructure TLS checks use the exact `localhost` SAN rather than a wildcard hostname.
+The shared mkcert certificate also contains every registered project hostname explicitly,
+for example `tembeek.localhost` and `rentbook.localhost`.
+
+`project setup` reconciles the certificate if its alias is missing and restarts Apache.
+
+Launchd bootstrap is now a hard gate: the generated plist is linted, installed root-owned,
+and any bootstrap/kickstart failure stops setup before TLS probing.
+
+
+## Hosting scanner and HTTPS local parity
+
+The local canonical URL is HTTPS:
+
+```text
+https://<alias>.localhost
+```
+
+Hosting/doctor checks use that value and no longer warn when `.env` contains the HTTPS
+local URL.
+
+Portability scans treat generated/developer-only trees such as `.sites-runtime/`,
+`.wrangler/`, npm caches, documentation-only README/TODO files, and placeholder
+`*.example`/`CPANEL_USER` paths as non-deployable evidence.
+
+Intentional `.htaccess` LOCAL host rules for `*.localhost` are also recognized as valid
+environment separation rather than flagged as deployment leakage. Genuine deployable
+source references to developer filesystem paths or localhost remain reportable.
+
+
+## Scanner false-positive regression coverage
+
+The scanner now uses the same canonical file walker for portability checks. Generated
+runtime/dev trees `.sites-runtime/` and `.wrangler/` are pruned at traversal time rather
+than filtered after grep output.
+
+`APP_URL` validation reads the actual `.env` value and expects
+`https://<alias>.localhost`.
+
+Documentation files, placeholder cPanel examples, and the intentional `.htaccess`
+`HTTP_HOST ... .localhost` LOCAL branch are excluded from deployable-source leakage
+findings. Actual RewriteRules that redirect to localhost are still reportable.
+
+
+## Root document-root protection
+
+For projects that intentionally use the repository root as the web document root,
+`tembeek-local` recognizes a marked defense-in-depth `.htaccess` block:
+
+```text
+# tembeek-local: internal-webroot-protection begin
+...
+# tembeek-local: internal-webroot-protection end
+```
+
+That block denies direct access to `.env`, `.git/`, `.tembeek/`, Composer metadata,
+PHPUnit metadata, and selected internal state files. When present, the hosting scanner
+reports those existing files as explicitly blocked instead of warning based only on
+their presence under the document root.
+
+
+## Semantic sensitive-file protection detection
+
+Sensitive-file checks are no longer tied to a Tembeek marker block. The scanner inspects
+the actual `.htaccess` protection semantics for each resource:
+
+- `.env` / `.env.*`
+- `.git/`
+- `composer.json`
+- `composer.lock`
+- `phpunit.xml`
+- `phpunit.xml.dist`
+
+Equivalent `Files`/`FilesMatch` or `RewriteRule ... [F]` protection is recognized,
+including pre-existing project rules that were not generated by `tembeek-local`.

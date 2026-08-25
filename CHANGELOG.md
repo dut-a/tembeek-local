@@ -1,5 +1,108 @@
 # Changelog
 
+## 1.6.13
+- Fix `.env` protection detection using literal rewrite-rule recognition plus conservative Files/FilesMatch deny detection.
+- Treat a `.git/` directory deny rewrite as protection for `.git/config`.
+- Add a focused regression for the two remaining web-root warnings.
+
+
+## 1.6.12
+- Remove marker-only detection from sensitive web-root checks.
+- Detect actual `.htaccess` protection semantics per internal file/directory.
+- Recognize existing FilesMatch and RewriteRule denials for `.env`, `.git`, Composer, and PHPUnit metadata.
+- Add a regression fixture matching the existing Tembeek `.htaccess` protection style.
+
+
+## 1.6.11
+- Make sensitive web-root checks protection-aware instead of presence-only.
+- Recognize the marked Tembeek internal-webroot protection block in `.htaccess`.
+- Report `.env`, `.git/config`, Composer metadata, and PHPUnit metadata as explicitly blocked when that policy is present.
+- Add hardened root-document-layout `.htaccess` example and regression coverage.
+
+
+## 1.6.10
+- Fix the actual stale `APP_URL` doctor check to expect `https://<alias>.localhost`.
+- Prune `.sites-runtime/` and `.wrangler/` in the canonical scan file walker.
+- Exclude documentation and cPanel placeholder examples from deployable-path leakage.
+- Recognize the intentional `.htaccess` LOCAL `HTTP_HOST .localhost` condition as portable.
+- Align JSON and human hosting checks around the same scanner semantics.
+- Add a scanner regression fixture covering the exact false positives seen on `tembeek`.
+
+
+## 1.6.9
+- Align APP_URL/doctor policy with canonical local HTTPS (`https://<alias>.localhost`).
+- Ignore generated `.sites-runtime/` and `.wrangler/` trees in hosting portability scans.
+- Ignore README/TODO documentation-only localhost examples and placeholder `CPANEL_USER`/`*.example` filesystem paths.
+- Treat intentional `.htaccess` LOCAL `*.localhost` rules as valid environment separation, not deployment leakage.
+- Preserve genuine blocking findings for deployable source and web-root exposure.
+
+
+## 1.6.8
+- Use exact `localhost` SAN for infrastructure TLS health probes.
+- Add every registered `<alias>.localhost` explicitly to the mkcert certificate.
+- Reconcile missing project-host SANs during `project setup`.
+- Harden launchd bootstrap/bootout lifecycle and stop immediately on bootstrap errors.
+- Validate launchd plist and set root ownership before bootstrap.
+
+
+## 1.6.7
+- Verify the TLS certificate actually served by Apache, not only the certificate file on disk.
+- Compare configured and served SHA-256 certificate fingerprints using SNI.
+- Make the Tembeek TLS vhost `_default_` on its dedicated HTTPS backend port.
+- Fail `setup apache` early when Apache serves a different certificate.
+- Add served SAN and `httpd -S` virtual-host diagnostics.
+
+
+## 1.6.6
+- Validate SANs on existing mkcert certificates before reusing them.
+- Regenerate local TLS material when `*.localhost` or required loopback SANs are missing.
+- Cleanly unload the previous Tembeek launchd/socat forwarder before rebinding ports 80/443.
+- Clear historical forwarder error logs during deliberate network reconciliation.
+- Show configured certificate SANs when a TLS probe fails.
+
+
+## 1.6.5
+- Fixed false local TLS verification failures caused by curl CA-store differences.
+- TLS probes now explicitly trust mkcert's `rootCA.pem`.
+- Added Homebrew `nss` installation before `mkcert -install` for Firefox/NSS trust.
+- Added explicit TCP 443 ownership checks.
+- Added detailed port-443, Apache HTTPS backend, mkcert CA, and launchd forwarder diagnostics.
+
+
+## 1.6.4
+- Made `migrate: true` imply that a local database must exist.
+- Project bootstrap provisions the default `<alias>_dev` shell database when no explicit DB name exists.
+- `db migrate` now succeeds cleanly when no migration command exists, reporting that the database shell is ready.
+- `database: false` only suppresses DB creation when `migrate` is also false.
+
+
+## 1.6.3
+- Restored all remaining baseline core functions accidentally dropped during the 1.6.0 refactor, including `detect_migration_dir`, `detect_database_need`, and `cmd_info`.
+- Expanded project-bootstrap dependency validation to cover transitive migration and doctor helpers.
+- Added runtime smoke coverage for migration-directory and doctor helper availability.
+
+
+## 1.6.2
+- Restored `env_set` and any missing core bootstrap helpers lost during the 1.6.0 refactor.
+- Added project-bootstrap dependency-closure validation, not just top-level command existence.
+- `project setup` now verifies `cmd_init`, env helpers, DB commands, and doctor before running.
+
+
+## 1.6.1
+- Restored the `cmd_init` function accidentally removed during the 1.6.0 HTTPS/env refactor.
+- Added internal function guards to `project setup` so missing orchestration commands fail immediately with an explicit internal error.
+- Added regression validation for `cmd_init`, `cmd_db_create`, `cmd_db_migrate`, and `doctor` availability.
+
+
+## 1.6.0
+- Added trusted local HTTPS using Homebrew `mkcert`.
+- Added Apache HTTPS backend on port 8443.
+- Added local port 443 forwarding alongside port 80.
+- Project setup now reconciles `APP_ENV=local` and `APP_URL=https://<alias>.localhost`.
+- Project doctor now probes canonical HTTPS URLs.
+- Added PROD/LOCAL-safe `tembeek.com` `.htaccess` example.
+
+
 ## 1.5.2
 - Changed the default generated local database name to `<alias>_dev`.
 - Explicit `database_name` in `.tembeek/local.yaml` still takes precedence.
