@@ -1877,3 +1877,24 @@ tembeek-local setup network
 ```
 
 Herd can still be used later, but only one local web stack can own the same loopback port/address at a time.
+
+
+## Machine database setup
+
+Use:
+
+```bash
+tembeek-local setup database
+```
+
+`setup mysql` is an alias. The default native runtime is `mysql@8.4`, configurable with `TEMBEEK_MYSQL_FORMULA`.
+
+The responsibility split is:
+
+```text
+setup database   -> machine MySQL runtime
+db create        -> project database + user + .env credentials
+db migrate       -> project schema
+```
+
+The setup command detects external runtimes such as MAMP but does not stop or adopt them; installs the configured Homebrew formula non-interactively if needed; starts it via `brew services`; verifies TCP 3306 and MySQL protocol reachability; and verifies `pdo_mysql` in the canonical Homebrew PHP runtime.

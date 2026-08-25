@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.0
+- Added `tembeek-local setup database` with `setup mysql` alias.
+- Standardized native local DB setup on configurable Homebrew `mysql@8.4`.
+- Added noninteractive install, `brew services` startup, TCP 3306/protocol checks, and canonical PHP `pdo_mysql` verification.
+- External runtimes such as MAMP are detected and reported as unmanaged, not adopted.
+- Preserved machine-runtime vs project DB/schema responsibility boundaries.
+
+
 ## 1.3.0
 - Made the launchd/socat HTTP forwarder dual-stack: `127.0.0.1:80` and `[::1]:80`.
 - Added separate IPv4 and IPv6 doctor probes.

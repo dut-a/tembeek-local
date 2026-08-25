@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 
 LOCALHOST_ROOT="${TEMBEEK_LOCAL_ROOT:-$HOME/Sites/localhost}"
 DEV_ROOT="${TEMBEEK_DEV_ROOT:-$HOME/Development}"
@@ -9,6 +9,7 @@ CONFIG_DIR="${TEMBEEK_CONFIG_DIR:-$HOME/.config/tembeek-local}"
 CONFIG_FILE="${TEMBEEK_CONFIG_FILE:-$CONFIG_DIR/config}"
 HTTP_PORT="${TEMBEEK_HTTP_PORT:-}"
 PHP_FORMULA="${TEMBEEK_PHP_FORMULA:-php@8.4}"
+MYSQL_FORMULA="${TEMBEEK_MYSQL_FORMULA:-mysql@8.4}"
 PF_CONF="${TEMBEEK_PF_CONF:-/etc/pf.conf}"
 PF_ANCHOR_NAME="${TEMBEEK_PF_ANCHOR_NAME:-com.tembeek.local}"
 PF_ANCHOR_FILE="${TEMBEEK_PF_ANCHOR_FILE:-/etc/pf.anchors/com.tembeek.local}"
@@ -209,6 +210,111 @@ php_extension_loaded() {
   "$php_bin" -r 'exit(extension_loaded($argv[1]) ? 0 : 1);' "$ext"
 }
 
+
+homebrew_mysql_bin() {
+  command -v brew >/dev/null 2>&1 || return 1
+  local prefix
+  prefix="$(brew --prefix "$MYSQL_FORMULA" 2>/dev/null || true)"
+  [[ -n "$prefix" && -x "$prefix/bin/mysql" ]] || return 1
+  printf '%s\n' "$prefix/bin/mysql"
+}
+
+homebrew_mysqladmin_bin() {
+  command -v brew >/dev/null 2>&1 || return 1
+  local prefix
+  prefix="$(brew --prefix "$MYSQL_FORMULA" 2>/dev/null || true)"
+  [[ -n "$prefix" && -x "$prefix/bin/mysqladmin" ]] || return 1
+  printf '%s\n' "$prefix/bin/mysqladmin"
+}
+
+external_mysql_runtimes() {
+  local brew_prefix
+  brew_prefix="$(brew --prefix 2>/dev/null || true)"
+  ps ax -o pid=,command= 2>/dev/null \
+    | grep -E '(^|/)(mysqld|mariadbd)([[:space:]]|$)' \
+    | { [[ -n "$brew_prefix" ]] && grep -Ev "$brew_prefix/(opt|Cellar)/(mysql|mysql@|mariadb)" || cat; } \
+    | grep -v grep || true
+}
+
+homebrew_mysql_service_started() {
+  command -v brew >/dev/null 2>&1 || return 1
+  brew services list 2>/dev/null | awk -v f="$MYSQL_FORMULA" '
+    $1 == f && $2 ~ /^(started|scheduled)$/ {found=1}
+    END {exit(found?0:1)}
+  '
+}
+
+homebrew_mysql_listener_ready() {
+  command -v lsof >/dev/null 2>&1 || return 1
+  lsof -nP -iTCP:3306 -sTCP:LISTEN 2>/dev/null | awk 'NR>1 {found=1} END{exit(found?0:1)}'
+}
+
+homebrew_mysql_protocol_ready() {
+  local mysqladmin
+  mysqladmin="$(homebrew_mysqladmin_bin 2>/dev/null || true)"
+  [[ -n "$mysqladmin" ]] || return 1
+  local out rc
+  set +e
+  out="$("$mysqladmin" --protocol=TCP -h 127.0.0.1 -P 3306 -u root ping 2>&1)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] && return 0
+  grep -Eqi 'Access denied for user|mysqld is alive' <<<"$out"
+}
+
+setup_database_runtime() {
+  require_cmd brew || die "Homebrew is required for database setup."
+
+  bold "Database runtime"
+  echo "Formula: $MYSQL_FORMULA"
+
+  local external
+  external="$(external_mysql_runtimes)"
+  if [[ -n "$external" ]]; then
+    warn "External MySQL/MariaDB runtime(s) detected; Tembeek-local will not manage them"
+    printf '%s\n' "$external" | sed 's/^/  /'
+  fi
+
+  if brew list --versions "$MYSQL_FORMULA" >/dev/null 2>&1; then
+    ok "Homebrew $MYSQL_FORMULA installed: $(brew list --versions "$MYSQL_FORMULA")"
+  else
+    bold "Installing Homebrew $MYSQL_FORMULA..."
+    HOMEBREW_NO_ASK=1 HOMEBREW_NO_ENV_HINTS=1 brew install -y "$MYSQL_FORMULA"
+    ok "Installed Homebrew $MYSQL_FORMULA"
+  fi
+
+  if homebrew_mysql_service_started; then
+    ok "Homebrew $MYSQL_FORMULA service already started"
+  else
+    bold "Starting Homebrew $MYSQL_FORMULA service..."
+    brew services start "$MYSQL_FORMULA"
+  fi
+
+  local tries=0
+  until homebrew_mysql_listener_ready; do
+    tries=$((tries+1))
+    [[ "$tries" -lt 15 ]] || die "Homebrew $MYSQL_FORMULA did not open TCP 3306."
+    sleep 1
+  done
+  ok "MySQL-compatible server listening on TCP 3306"
+
+  homebrew_mysql_protocol_ready \
+    && ok "MySQL protocol reachable on 127.0.0.1:3306" \
+    || die "TCP 3306 is open, but MySQL protocol verification failed."
+
+  php_extension_loaded pdo_mysql \
+    && ok "Canonical Homebrew PHP has pdo_mysql" \
+    || die "Canonical Homebrew PHP is missing pdo_mysql."
+
+  ok "Canonical PHP runtime: $(active_php_bin)"
+
+  echo
+  ok "Database runtime ready"
+  echo "Next project steps:"
+  echo "  tembeek-local db create <alias>"
+  echo "  tembeek-local db migrate <alias>"
+}
+
 mysql_compatible_client() {
   local candidate
   for candidate in mysql mariadb; do
@@ -379,6 +485,7 @@ ${BOLD}COMMON WORKFLOWS${RESET}
   New workstation:
       tembeek-local setup apache
       tembeek-local setup network
+  tembeek-local setup database     # alias: setup mysql
       tembeek-local doctor
 
   Newly cloned project:
@@ -407,6 +514,7 @@ ${BOLD}ENVIRONMENT OVERRIDES${RESET}
   TEMBEEK_DEV_ROOT
   TEMBEEK_HTTP_PORT
   TEMBEEK_PHP_FORMULA
+  TEMBEEK_MYSQL_FORMULA=mysql@8.4
   TEMBEEK_PF_CONF
   TEMBEEK_PF_ANCHOR_NAME
   TEMBEEK_PF_ANCHOR_FILE
@@ -1225,11 +1333,11 @@ cmd_setup() {
   case "$target" in
     apache) cmd_setup_apache "$@" ;;
     network) cmd_setup_network "$@" ;;
-    "") die "Usage: tembeek-local setup <apache|network>" ;;
+    database|mysql) cmd_setup_database "$@" ;;
+    "") die "Usage: tembeek-local setup <apache|network|database>" ;;
     *) die "Unknown setup target: $target" ;;
   esac
 }
-
 
 yaml_value() {
   local file="$1" key="$2"
@@ -1802,6 +1910,12 @@ ensure_database_manifest_defaults() {
   mcmd="$(detect_migration_command "$project")"
   yaml_set "$manifest" migration_dir "$mdir"
   yaml_set "$manifest" migration_command "$mcmd"
+}
+
+
+cmd_setup_database() {
+  [[ $# -eq 0 ]] || die "Usage: tembeek-local setup database"
+  setup_database_runtime
 }
 
 cmd_db_create() {
