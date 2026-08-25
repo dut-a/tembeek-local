@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.4.0"
+VERSION="1.4.1"
 
 LOCALHOST_ROOT="${TEMBEEK_LOCAL_ROOT:-$HOME/Sites/localhost}"
 DEV_ROOT="${TEMBEEK_DEV_ROOT:-$HOME/Development}"
@@ -410,12 +410,19 @@ ${BOLD}USAGE${RESET}
   tembeek-local <command> [arguments] [options]
 
 ${BOLD}WORKSTATION SETUP${RESET}
+  ${CYAN}setup workstation${RESET}
+      Converge shared workstation infrastructure: Apache/PHP, localhost networking,
+      and the Homebrew MySQL runtime. Alias: setup all.
+
   ${CYAN}setup apache${RESET}
       Non-interactively configure Homebrew Apache + PHP ${PHP_FORMULA#php@}, *.localhost hosting,
       mod_rewrite, mod_vhost_alias, .htaccess, and Apache PHP execution.
 
   ${CYAN}setup network${RESET}
       Configure a root-owned launchd TCP forwarder from port 80 to Apache port ${HTTP_PORT}.
+
+  ${CYAN}setup database${RESET}
+      Install/start/verify the shared Homebrew MySQL runtime. Alias: setup mysql.
 
   ${CYAN}doctor${RESET}
       Diagnose Homebrew / Apache / canonical PHP / MySQL / network ownership, including Herd conflicts.
@@ -483,10 +490,13 @@ ${BOLD}NETWORK REMOVAL${RESET}
 
 ${BOLD}COMMON WORKFLOWS${RESET}
   New workstation:
+      tembeek-local setup workstation
+      tembeek-local doctor
+
+  Targeted shared-infrastructure repair:
       tembeek-local setup apache
       tembeek-local setup network
-  tembeek-local setup database     # alias: setup mysql
-      tembeek-local doctor
+      tembeek-local setup database
 
   Newly cloned project:
       tembeek-local init ~/Development/tembeek-rent-book --alias rentbook
@@ -1326,15 +1336,35 @@ cmd_setup_apache() {
   echo "  tembeek-local doctor rentbook"
 }
 
+
+cmd_setup_workstation() {
+  [[ $# -eq 0 ]] || die "Usage: tembeek-local setup workstation"
+
+  bold "Tembeek workstation setup"
+  echo
+
+  cmd_setup_apache
+  echo
+
+  cmd_setup_network
+  echo
+
+  cmd_setup_database
+
+  echo
+  ok "Shared workstation infrastructure is ready"
+}
+
 cmd_setup() {
   local target="${1:-}"
   shift || true
 
   case "$target" in
+    workstation|all) cmd_setup_workstation "$@" ;;
     apache) cmd_setup_apache "$@" ;;
     network) cmd_setup_network "$@" ;;
     database|mysql) cmd_setup_database "$@" ;;
-    "") die "Usage: tembeek-local setup <apache|network|database>" ;;
+    "") die "Usage: tembeek-local setup <workstation|apache|network|database>" ;;
     *) die "Unknown setup target: $target" ;;
   esac
 }

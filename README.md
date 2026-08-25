@@ -1898,3 +1898,40 @@ db migrate       -> project schema
 ```
 
 The setup command detects external runtimes such as MAMP but does not stop or adopt them; installs the configured Homebrew formula non-interactively if needed; starts it via `brew services`; verifies TCP 3306 and MySQL protocol reachability; and verifies `pdo_mysql` in the canonical Homebrew PHP runtime.
+
+
+## Shared workstation aggregate setup
+
+Apache/PHP, localhost forwarding, and the MySQL server are shared workstation infrastructure. They are not per-project resources.
+
+Use:
+
+```bash
+tembeek-local setup workstation
+```
+
+Alias:
+
+```bash
+tembeek-local setup all
+```
+
+This is implemented inside the main CLI and reuses the existing setup functions:
+
+```text
+cmd_setup_apache
+    ↓
+cmd_setup_network
+    ↓
+cmd_setup_database
+```
+
+The individual commands remain available for targeted repair:
+
+```bash
+tembeek-local setup apache
+tembeek-local setup network
+tembeek-local setup database
+```
+
+Once a workstation is healthy, a new project does not need to repeat shared setup merely because it is a new shell session or repository.

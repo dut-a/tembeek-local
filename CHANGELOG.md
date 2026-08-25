@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.4.1
+- Added `tembeek-local setup workstation`.
+- Added `tembeek-local setup all` alias.
+- Aggregate setup reuses the existing Apache, network, and database setup functions.
+- Kept individual setup commands for targeted repair/reconciliation.
+- Updated help to distinguish shared workstation setup from per-project onboarding.
+
+
 ## 1.4.0
 - Added `tembeek-local setup database` with `setup mysql` alias.
 - Standardized native local DB setup on configurable Homebrew `mysql@8.4`.
