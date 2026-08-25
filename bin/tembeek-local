@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.6.13"
+VERSION="1.7.2"
 
 LOCALHOST_ROOT="${TEMBEEK_LOCAL_ROOT:-$HOME/Sites/localhost}"
 DEV_ROOT="${TEMBEEK_DEV_ROOT:-$HOME/Development}"
@@ -415,6 +415,9 @@ ${BOLD}USAGE${RESET}
   tembeek-local <command> [arguments] [options]
 
 ${BOLD}WORKSTATION SETUP${RESET}
+  up                       Start daily local infrastructure
+  down                     Stop daily local infrastructure
+  status                   Show local infrastructure state
   ${CYAN}setup workstation${RESET}
       Converge shared workstation infrastructure: Apache/PHP, localhost networking,
       and the Homebrew MySQL runtime. Alias: setup all.
@@ -1868,6 +1871,124 @@ cmd_project() {
     "") die "Usage: tembeek-local project <register|deregister|setup|list> ..." ;;
     *) die "Unknown project action: $action" ;;
   esac
+}
+
+
+cmd_up() {
+  [[ $# -eq 0 ]] || die "Usage: tembeek-local up"
+
+  bold "Tembeek local infrastructure: UP"
+  echo
+
+  require_cmd brew || die "Homebrew is required. Run: tembeek-local setup workstation"
+  require_cmd launchctl || die "launchctl is required."
+
+  if apache_backend_is_listening "$HTTP_PORT" && apache_backend_is_listening "$HTTPS_PORT"; then
+    ok "Apache already running"
+  else
+    restart_or_start_httpd
+    sleep 1
+    apache_backend_is_listening "$HTTP_PORT" \
+      || die "Apache HTTP backend did not start. Run: tembeek-local setup workstation"
+    apache_backend_is_listening "$HTTPS_PORT" \
+      || die "Apache HTTPS backend did not start. Run: tembeek-local setup workstation"
+    ok "Apache started"
+  fi
+
+  if brew list --versions "$MYSQL_FORMULA" >/dev/null 2>&1; then
+    if homebrew_mysql_protocol_ready >/dev/null 2>&1; then
+      ok "MySQL already running"
+    else
+      HOMEBREW_NO_ENV_HINTS=1 brew services start "$MYSQL_FORMULA" >/dev/null
+      sleep 1
+      ok "MySQL started"
+    fi
+  else
+    printf "MySQL not provisioned; skipping\n"
+  fi
+
+  if network_forwarder_is_loaded; then
+    ok "HTTP/HTTPS forwarder already running"
+  else
+    printf "Starting the privileged :80/:443 forwarder may request your macOS administrator password.\n"
+    [[ -f "$NETWORK_FORWARDER_PLIST" ]] \
+      || die "Network forwarder is not provisioned. Run: tembeek-local setup workstation"
+
+    local out
+    if ! out="$(sudo launchctl bootstrap system "$NETWORK_FORWARDER_PLIST" 2>&1)"; then
+      fail "Could not start Tembeek HTTP/HTTPS forwarder"
+      [[ -n "$out" ]] && printf '%s\n' "$out" | sed 's/^/  /'
+      return 1
+    fi
+    sudo launchctl enable system/"$NETWORK_FORWARDER_LABEL" >/dev/null 2>&1 || true
+    sudo launchctl kickstart -k system/"$NETWORK_FORWARDER_LABEL" >/dev/null 2>&1 || true
+    sleep 1
+    ok "HTTP/HTTPS forwarder started"
+  fi
+
+  echo
+  doctor_network
+  echo
+  ok "Tembeek local infrastructure is up"
+  echo "Projects: https://<alias>.localhost"
+}
+
+cmd_down() {
+  [[ $# -eq 0 ]] || die "Usage: tembeek-local down"
+
+  bold "Tembeek local infrastructure: DOWN"
+  echo
+
+  if network_forwarder_is_loaded; then
+    printf "Stopping the privileged :80/:443 forwarder may request your macOS administrator password.\n"
+    sudo launchctl bootout system/"$NETWORK_FORWARDER_LABEL" >/dev/null 2>&1 \
+      || sudo launchctl bootout system "$NETWORK_FORWARDER_PLIST" >/dev/null 2>&1 \
+      || true
+    ok "HTTP/HTTPS forwarder stopped"
+  else
+    ok "HTTP/HTTPS forwarder already stopped"
+  fi
+
+  if brew list --versions httpd >/dev/null 2>&1; then
+    HOMEBREW_NO_ENV_HINTS=1 brew services stop httpd >/dev/null 2>&1 || true
+    ok "Apache stopped"
+  fi
+
+  if brew list --versions "$MYSQL_FORMULA" >/dev/null 2>&1; then
+    HOMEBREW_NO_ENV_HINTS=1 brew services stop "$MYSQL_FORMULA" >/dev/null 2>&1 || true
+    ok "MySQL stopped"
+  fi
+
+  echo
+  ok "Tembeek local infrastructure is down"
+  echo "Projects, aliases, TLS certificates, databases and configuration are preserved."
+}
+
+cmd_status() {
+  [[ $# -eq 0 ]] || die "Usage: tembeek-local status"
+
+  bold "Tembeek local infrastructure status"
+  echo
+
+  apache_backend_is_listening "$HTTP_PORT" \
+    && ok "Apache HTTP backend: UP (:${HTTP_PORT})" \
+    || warn "Apache HTTP backend: DOWN (:${HTTP_PORT})"
+
+  apache_backend_is_listening "$HTTPS_PORT" \
+    && ok "Apache HTTPS backend: UP (:${HTTPS_PORT})" \
+    || warn "Apache HTTPS backend: DOWN (:${HTTPS_PORT})"
+
+  network_forwarder_is_loaded \
+    && ok "HTTP/HTTPS forwarder: UP (:80/:443)" \
+    || warn "HTTP/HTTPS forwarder: DOWN"
+
+  if brew list --versions "$MYSQL_FORMULA" >/dev/null 2>&1; then
+    homebrew_mysql_protocol_ready >/dev/null 2>&1 \
+      && ok "MySQL: UP ($MYSQL_FORMULA)" \
+      || warn "MySQL: DOWN ($MYSQL_FORMULA)"
+  else
+    printf "MySQL: not provisioned\n"
+  fi
 }
 
 cmd_setup_workstation() {
@@ -4006,6 +4127,9 @@ main() {
   shift || true
 
   case "$cmd" in
+    up)           cmd_up "$@" ;;
+    down)         cmd_down "$@" ;;
+    status)       cmd_status "$@" ;;
     setup)       cmd_setup "$@" ;;
     init)        cmd_init "$@" ;;
     info)        cmd_info "$@" ;;

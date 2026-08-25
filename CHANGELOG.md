@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.7.2
+- Fix lifecycle crash caused by calling `info` as a logger even though `info()` is the project-info command.
+- Replace lifecycle informational messages with direct output.
+- Add a regression preventing `cmd_up`, `cmd_down`, and `cmd_status` from reusing the `info` command name as a logging helper.
+
+
+## 1.7.1
+- Fix `up`, `down`, and `status` exiting silently because the main dispatcher shifted arguments twice.
+- Use `homebrew_mysql_protocol_ready` for lifecycle MySQL health instead of the nonexistent `mysql_native_runtime_running` helper.
+- Make the administrator-password prompt for the root-owned port 80/443 forwarder explicit.
+
+
+## 1.7.0
+- Add `tembeek-local up` for daily startup of Apache, HTTP/HTTPS forwarding, and provisioned MySQL.
+- Add `tembeek-local down` for clean end-of-day shutdown without deleting local state.
+- Add `tembeek-local status` for shared infrastructure state.
+- Keep `setup workstation` reserved for provisioning/reconciliation.
+
+
 ## 1.6.13
 - Fix `.env` protection detection using literal rewrite-rule recognition plus conservative Files/FilesMatch deny detection.
 - Treat a `.git/` directory deny rewrite as protection for `.git/config`.
