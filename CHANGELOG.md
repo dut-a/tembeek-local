@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.8.4
+- Add a styled repository-level Makefile.
+- Add `make test` as the default quality entry point for Bash syntax, smoke checks, and regression tests.
+- Add focused targets: `shell-check`, `smoke`, `test-regression`, `test-all-tests`, `list-tests`, and `ci`.
+- Auto-discover regression shell tests under `tests/`.
+- Document the Make-based development workflow in README.
+
+
 ## 1.8.3
 - Restore the pre-1.8.1 styled built-in help presentation.
 - Merge project-root configuration and registry-recovery commands into the styled help instead of replacing the help function.

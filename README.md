@@ -2467,3 +2467,39 @@ New commands must be merged into that presentation rather than replacing it with
 plain unstyled command dump.
 
 The help surface and README command reference are regression-tested together.
+
+## Development and regression tests
+
+Run the normal quality suite from the repository root:
+
+```bash
+make test
+```
+
+Available targets:
+
+```bash
+make help
+make shell-check
+make smoke
+make test-regression
+make test-all-tests
+make list-tests
+make ci
+```
+
+`make test` runs:
+
+```text
+Bash syntax
+  ↓
+CLI smoke checks
+  ↓
+all tests/*regression*.sh
+```
+
+The regression runner discovers matching scripts automatically, so a new regression
+fixture becomes part of the normal test suite without editing the Makefile unless that
+fixture needs special arguments.
+
+`make ci` is currently an alias for `make test`.
