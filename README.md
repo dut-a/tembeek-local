@@ -2276,3 +2276,194 @@ services. `status` does not require privilege escalation.
 MySQL lifecycle health is determined by a protocol probe on `127.0.0.1:3306`, not
 merely by process-name inspection. An authentication rejection still proves the server
 is alive.
+
+
+## Recoverable project registry
+
+`~/.config/tembeek-local/projects.json` is now treated as a **derived machine index**,
+not irreplaceable state.
+
+The committed `.tembeek/local.yaml` files are the recovery source of truth.
+
+```bash
+# Show what can be recovered without writing anything
+tembeek-local project discover
+
+# Compare projects.json with recoverable manifest state
+tembeek-local project registry verify
+
+# Rebuild projects.json deterministically
+tembeek-local project registry rebuild
+```
+
+If `projects.json` is missing and a normal registry-backed command needs it,
+`tembeek-local` automatically attempts recovery before creating an empty registry.
+
+Rebuild behavior:
+
+- scans `${TEMBEEK_PROJECT_ROOTS:-$TEMBEEK_DEV_ROOT}`; multiple roots may be
+  colon-separated via `TEMBEEK_PROJECT_ROOTS`
+- prunes `.git`, virtualenvs, dependency trees and generated build directories
+- discovers `.tembeek/local.yaml`
+- uses committed `registry_key`, `alias`, `bootstrap_database`,
+  `bootstrap_migrate`, and `bootstrap_doctor` when present
+- deterministically infers legacy values when those recovery fields are absent
+- canonicalizes project paths
+- sorts entries
+- validates generated JSON
+- writes atomically
+- backs up an existing registry before explicit rebuild
+- uses mode `0600` for machine registry files
+
+`project register` now seeds the recovery metadata into an existing committed manifest
+without overwriting explicit values.
+
+<!-- tembeek-local-command-reference:begin -->
+## Command reference
+
+This section is intended to stay synchronized with `tembeek-local --help`.
+
+### Daily lifecycle
+
+```bash
+tembeek-local up
+tembeek-local status
+tembeek-local down
+```
+
+`setup workstation` is provisioning/reconciliation; `up` and `down` are the normal daily lifecycle commands.
+
+### Workstation setup
+
+```bash
+tembeek-local setup workstation
+tembeek-local setup all
+tembeek-local setup apache
+tembeek-local setup network
+tembeek-local setup database
+tembeek-local setup mysql
+```
+
+### Project registry
+
+```bash
+tembeek-local project register <key> <project-path> [alias]
+tembeek-local project add <key> <project-path> [alias]
+
+tembeek-local project deregister <key>
+tembeek-local project unregister <key>
+tembeek-local project remove <key>
+tembeek-local project rm <key>
+
+tembeek-local project setup <key>
+tembeek-local project bootstrap <key>
+
+tembeek-local project list
+tembeek-local project ls
+
+tembeek-local project roots
+tembeek-local project roots set <root> [root ...]
+tembeek-local project roots add <root>
+tembeek-local project roots remove <root>
+
+tembeek-local project discover
+tembeek-local project registry verify
+tembeek-local project registry rebuild
+```
+
+Registry recovery semantics:
+
+- `projects.json` is a derived machine index.
+- `project discover` scans configured project roots for committed `.tembeek/local.yaml`.
+- `project registry verify` checks whether the registry matches recoverable manifest state.
+- `project registry rebuild` reconstructs it deterministically and backs up an existing registry.
+- if `projects.json` is missing, registry-backed operations attempt automatic recovery before creating an empty registry.
+- `TEMBEEK_PROJECT_ROOTS` may contain colon-separated recovery roots.
+- `TEMBEEK_DEV_ROOT` remains the default root when no explicit recovery roots are configured.
+
+
+Persistent discovery-root configuration:
+
+```bash
+# Inspect what discovery will scan
+tembeek-local project roots
+
+# Replace the persistent root set
+tembeek-local project roots set ~/dev/code ~/Development
+
+# Incrementally maintain it
+tembeek-local project roots add ~/Projects
+tembeek-local project roots remove ~/Development
+```
+
+Precedence is:
+
+```text
+TEMBEEK_PROJECT_ROOTS environment override
+    ↓
+PROJECT_ROOTS in ~/.config/tembeek-local/config
+    ↓
+TEMBEEK_DEV_ROOT / ~/Development default
+```
+
+`project discover` always prints the effective roots before scanning, so an empty
+result is diagnosable without inspecting environment variables manually.
+
+### Project / alias operations
+
+```bash
+tembeek-local init <project-path> [--alias <alias>]
+tembeek-local add <alias> <project-path>
+tembeek-local remove <alias>
+tembeek-local list
+tembeek-local path <alias>
+tembeek-local url <alias>
+tembeek-local info <alias>
+```
+
+### Database
+
+```bash
+tembeek-local db create <alias>
+tembeek-local db migrate <alias>
+tembeek-local db status <alias>
+```
+
+### Readiness and policy
+
+```bash
+tembeek-local doctor
+tembeek-local doctor <alias>
+
+tembeek-local check hosting <alias>
+tembeek-local check hosting <alias> --json
+tembeek-local check all <alias>
+tembeek-local check all <alias> --json
+tembeek-local check all <alias> --strict-warnings
+tembeek-local check all <alias> --no-strict-warnings
+
+tembeek-local policy validate <alias>
+tembeek-local policy validate <alias> --json
+tembeek-local policy migrate <alias>
+```
+
+### General
+
+```bash
+tembeek-local help
+tembeek-local --help
+tembeek-local -h
+tembeek-local version
+tembeek-local --version
+tembeek-local -v
+```
+<!-- tembeek-local-command-reference:end -->
+
+
+## Built-in help
+
+`tembeek-local --help` uses the styled terminal presentation established before v1.8.1.
+New commands must be merged into that presentation rather than replacing it with a
+plain unstyled command dump.
+
+The help surface and README command reference are regression-tested together.

@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.8.3
+- Restore the pre-1.8.1 styled built-in help presentation.
+- Merge project-root configuration and registry-recovery commands into the styled help instead of replacing the help function.
+- Add styled recovery/defaults/environment sections for the new 1.8.x functionality.
+- Add a regression gate that requires the styled help contract and the new commands to coexist.
+
+
+## 1.8.2
+- Add persistent project discovery roots to machine config (`PROJECT_ROOTS`).
+- Add `project roots`, `project roots set`, `project roots add`, and `project roots remove`.
+- Make discovery-root precedence explicit: `TEMBEEK_PROJECT_ROOTS` override → machine config → `TEMBEEK_DEV_ROOT`.
+- Make `project discover` print every effective root before scanning.
+- Update built-in help and README with persistent discovery-root configuration.
+- Add regression coverage for persistence, precedence, help, and README synchronization.
+
+
+## 1.8.1
+- Add `project discover`, `project registry verify`, and `project registry rebuild` to built-in help.
+- Replace the help surface with a complete command hierarchy covering lifecycle, setup, project registry, database, readiness, and policy commands.
+- Reconcile README command reference with the executable help surface.
+- Add a help/README synchronization regression gate for registry recovery and other high-value commands.
+
+
+## 1.8.0
+- Make `projects.json` recoverable from committed `.tembeek/local.yaml` manifests.
+- Add `project discover`, `project registry verify`, and `project registry rebuild`.
+- Automatically recover a missing registry when recoverable manifests exist.
+- Seed `registry_key` and bootstrap recovery metadata during project registration.
+- Rebuild atomically, deterministically, and with backup of an existing registry.
+- Support colon-separated recovery roots through `TEMBEEK_PROJECT_ROOTS`.
+
+
 ## 1.7.2
 - Fix lifecycle crash caused by calling `info` as a logger even though `info()` is the project-info command.
 - Replace lifecycle informational messages with direct output.

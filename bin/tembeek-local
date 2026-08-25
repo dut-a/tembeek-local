@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.7.2"
+VERSION="1.8.3"
 
 LOCALHOST_ROOT="${TEMBEEK_LOCAL_ROOT:-$HOME/Sites/localhost}"
 DEV_ROOT="${TEMBEEK_DEV_ROOT:-$HOME/Development}"
@@ -48,32 +48,84 @@ require_cmd() {
 
 
 load_machine_config() {
-  local configured_port=""
+  local configured_port="" configured_roots=""
+
   if [[ -f "$CONFIG_FILE" ]]; then
-    configured_port="$(awk -F= '$1=="HTTP_PORT"{print $2; exit}' "$CONFIG_FILE" 2>/dev/null || true)"
+    configured_port="$(awk -F= '$1=="HTTP_PORT"{sub(/^[^=]*=/,""); print; exit}' "$CONFIG_FILE" 2>/dev/null || true)"
+    configured_roots="$(awk -F= '$1=="PROJECT_ROOTS"{sub(/^[^=]*=/,""); print; exit}' "$CONFIG_FILE" 2>/dev/null || true)"
   fi
+
   if [[ -z "${HTTP_PORT:-}" ]]; then
     HTTP_PORT="${configured_port:-8080}"
+  fi
+
+  # TEMBEEK_PROJECT_ROOTS remains the highest-precedence one-shot override.
+  # PROJECT_ROOTS is the persisted machine preference.
+  if [[ -z "${PROJECT_ROOTS:-}" && -n "$configured_roots" ]]; then
+    PROJECT_ROOTS="$configured_roots"
+  fi
+}
+
+save_machine_config_value() {
+  local key="$1" value="$2"
+  mkdir -p "$CONFIG_DIR"
+
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/tembeek-local-config.XXXXXX")"
+
+  if [[ -f "$CONFIG_FILE" ]]; then
+    awk -v k="$key" -v v="$value" '
+      BEGIN {done=0}
+      index($0, k "=") == 1 {
+        if (!done) { print k "=" v; done=1 }
+        next
+      }
+      { print }
+      END { if (!done) print k "=" v }
+    ' "$CONFIG_FILE" > "$tmp"
+  else
+    printf '%s=%s\n' "$key" "$value" > "$tmp"
+  fi
+
+  mv "$tmp" "$CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE"
+}
+
+save_machine_project_roots() {
+  local roots="$1"
+  save_machine_config_value "PROJECT_ROOTS" "$roots"
+  PROJECT_ROOTS="$roots"
+}
+
+canonical_project_root() {
+  local root="$1"
+  [[ -d "$root" ]] || die "Project root directory not found: $root"
+  (cd "$root" && pwd -P)
+}
+
+effective_project_roots_value() {
+  if [[ -n "${TEMBEEK_PROJECT_ROOTS:-}" ]]; then
+    printf '%s\n' "$TEMBEEK_PROJECT_ROOTS"
+  elif [[ -n "${PROJECT_ROOTS:-}" ]]; then
+    printf '%s\n' "$PROJECT_ROOTS"
+  else
+    printf '%s\n' "$DEV_ROOT"
+  fi
+}
+
+project_roots_source() {
+  if [[ -n "${TEMBEEK_PROJECT_ROOTS:-}" ]]; then
+    printf '%s\n' "environment override (TEMBEEK_PROJECT_ROOTS)"
+  elif [[ -n "${PROJECT_ROOTS:-}" ]]; then
+    printf '%s\n' "machine config ($CONFIG_FILE)"
+  else
+    printf '%s\n' "default development root (TEMBEEK_DEV_ROOT / ~/Development)"
   fi
 }
 
 save_machine_http_port() {
   local port="$1"
-  mkdir -p "$CONFIG_DIR"
-  local tmp
-  tmp="$(mktemp "${TMPDIR:-/tmp}/tembeek-local-config.XXXXXX")"
-  if [[ -f "$CONFIG_FILE" ]]; then
-    awk -v p="$port" '
-      BEGIN {done=0}
-      /^HTTP_PORT=/ { if (!done) { print "HTTP_PORT=" p; done=1 } ; next }
-      { print }
-      END { if (!done) print "HTTP_PORT=" p }
-    ' "$CONFIG_FILE" > "$tmp"
-  else
-    printf 'HTTP_PORT=%s\n' "$port" > "$tmp"
-  fi
-  mv "$tmp" "$CONFIG_FILE"
-  chmod 600 "$CONFIG_FILE"
+  save_machine_config_value "HTTP_PORT" "$port"
 }
 
 port_listener_summary() {
@@ -450,6 +502,30 @@ ${BOLD}PROJECTS${RESET}
   ${CYAN}project list${RESET}
       List configured project keys, aliases and repository paths.
 
+  ${CYAN}project roots${RESET}
+      Show the effective project discovery roots and whether they came from
+      environment override, machine config, or the default development root.
+
+  ${CYAN}project roots set <root> [root ...]${RESET}
+      Persist the machine's project discovery roots.
+
+  ${CYAN}project roots add <root>${RESET}
+      Add one persistent project discovery root.
+
+  ${CYAN}project roots remove <root>${RESET}
+      Remove one persistent project discovery root.
+
+  ${CYAN}project discover${RESET}
+      Scan configured roots for committed .tembeek/local.yaml manifests and
+      show projects recoverable into projects.json.
+
+  ${CYAN}project registry verify${RESET}
+      Compare projects.json with deterministic state recoverable from committed
+      project manifests.
+
+  ${CYAN}project registry rebuild${RESET}
+      Rebuild projects.json from committed manifests, backing up the old registry.
+
   ${CYAN}init <project-path> [--alias <alias>]${RESET}
       Detect document root, create .tembeek/local.yaml when absent, bootstrap
       .env, and register the local alias.
@@ -520,6 +596,15 @@ ${BOLD}COMMON WORKFLOWS${RESET}
       tembeek-local setup network
       tembeek-local setup database
 
+  Configure discovery roots:
+      tembeek-local project roots set ~/dev/code ~/Development
+      tembeek-local project roots
+      tembeek-local project discover
+
+  Recover the machine project registry:
+      tembeek-local project registry verify
+      tembeek-local project registry rebuild
+
   Register + bootstrap a project:
       tembeek-local project register rentbook ~/Development/tembeek-rent-book rentbook
       tembeek-local project setup rentbook
@@ -539,6 +624,7 @@ ${BOLD}COMMON WORKFLOWS${RESET}
 ${BOLD}DEFAULTS${RESET}
   Alias registry     ${DIM}${LOCALHOST_ROOT}${RESET}
   Development root  ${DIM}${DEV_ROOT}${RESET}
+  Project roots     ${DIM}$(effective_project_roots_value)${RESET}
   Apache HTTP       ${DIM}${HTTP_PORT}${RESET}
   Apache HTTPS      ${DIM}${HTTPS_PORT}${RESET}
   Machine config     ${DIM}${CONFIG_FILE}${RESET}
@@ -552,6 +638,7 @@ ${BOLD}ENVIRONMENT OVERRIDES${RESET}
   TEMBEEK_LOCAL_ROOT
   TEMBEEK_PROJECTS_FILE
   TEMBEEK_DEV_ROOT
+  TEMBEEK_PROJECT_ROOTS
   TEMBEEK_HTTP_PORT
   TEMBEEK_HTTPS_PORT
   TEMBEEK_TLS_DIR
@@ -565,6 +652,16 @@ ${BOLD}ENVIRONMENT OVERRIDES${RESET}
   TEMBEEK_MYSQL_ADMIN_PORT
   TEMBEEK_MYSQL_ADMIN_PASSWORD
 
+${BOLD}REGISTRY RECOVERY${RESET}
+  ${DIM}projects.json is a derived machine index. If it disappears, registry-backed
+  commands attempt recovery from committed .tembeek/local.yaml manifests before
+  creating an empty registry.
+
+  Discovery precedence:
+    TEMBEEK_PROJECT_ROOTS environment override
+      -> PROJECT_ROOTS in machine config
+      -> TEMBEEK_DEV_ROOT / ~/Development default${RESET}
+
 ${BOLD}HELP & VERSION${RESET}
   tembeek-local help | -h | --help
   tembeek-local version | -v | --version
@@ -573,6 +670,7 @@ ${DIM}Project contract: .tembeek/local.yaml (schema_version: 1)
 See README.md for full operating and troubleshooting documentation.${RESET}
 EOF
 }
+
 
 normalize_alias() {
   local a="$1"
@@ -1654,9 +1752,332 @@ cmd_setup_apache() {
 
 
 
+project_recovery_roots() {
+  effective_project_roots_value | tr ':' '\n' | awk 'NF'
+}
+
+project_recovery_scan_tsv() {
+  local root manifest project key alias database migrate doctor engine mcmd
+
+  while IFS= read -r root; do
+    [[ -d "$root" ]] || continue
+
+    while IFS= read -r manifest; do
+      project="$(cd "$(dirname "$manifest")/.." 2>/dev/null && pwd -P)" || continue
+
+      key="$(yaml_value "$manifest" "registry_key" 2>/dev/null || true)"
+      [[ -n "$key" ]] || key="$(yaml_value "$manifest" "project" 2>/dev/null || true)"
+      [[ -n "$key" ]] || key="$(basename "$project")"
+      key="$(printf '%s' "$key" | tr '[:upper:] ' '[:lower:]-' | tr -cd 'a-z0-9._-')"
+      [[ -n "$key" ]] || continue
+
+      alias="$(yaml_value "$manifest" "alias" 2>/dev/null || true)"
+      [[ -n "$alias" ]] || alias="$(basename "$project")"
+      alias="$(normalize_alias "$alias")"
+
+      database="$(yaml_value "$manifest" "bootstrap_database" 2>/dev/null || true)"
+      migrate="$(yaml_value "$manifest" "bootstrap_migrate" 2>/dev/null || true)"
+      doctor="$(yaml_value "$manifest" "bootstrap_doctor" 2>/dev/null || true)"
+
+      # Legacy manifests predate explicit recovery metadata. Infer conservative,
+      # deterministic defaults from their committed project policy.
+      if [[ "$database" != "true" && "$database" != "false" ]]; then
+        engine="$(yaml_value "$manifest" "database_engine" 2>/dev/null || true)"
+        [[ -n "$engine" && "$engine" != "none" ]] && database=true || database=false
+      fi
+
+      if [[ "$migrate" != "true" && "$migrate" != "false" ]]; then
+        mcmd="$(yaml_value "$manifest" "migration_command" 2>/dev/null || true)"
+        [[ -n "$mcmd" && "$mcmd" != "none" ]] && migrate=true || migrate=false
+      fi
+
+      [[ "$doctor" == "true" || "$doctor" == "false" ]] || doctor=true
+
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$key" "$project" "$alias" "$database" "$migrate" "$doctor"
+    done < <(
+      find "$root" \
+        \( -name .git -o -name .venv -o -name venv -o -name vendor -o -name node_modules -o -name build -o -name dist -o -name target \) -prune -o \
+        -path '*/.tembeek/local.yaml' -type f -print 2>/dev/null | sort
+    )
+  done < <(project_recovery_roots)
+}
+
+project_recovery_json() {
+  local tmp
+  tmp="$(mktemp)"
+  project_recovery_scan_tsv > "$tmp"
+
+  "$(active_php_bin)" -r '
+    $file=$argv[1];
+    $projects=[];
+    $collisions=[];
+    foreach (file($file, FILE_IGNORE_NEW_LINES|FILE_SKIP_EMPTY_LINES) ?: [] as $line) {
+      $parts=explode("\t", $line);
+      if (count($parts) !== 6) continue;
+      [$key,$path,$alias,$database,$migrate,$doctor]=$parts;
+
+      $final=$key;
+      if (isset($projects[$final]) && $projects[$final]["path"] !== $path) {
+        $n=($collisions[$key] ?? 1) + 1;
+        do {
+          $final=$key."-".$n++;
+        } while (isset($projects[$final]));
+        $collisions[$key]=$n-1;
+      }
+
+      $projects[$final]=[
+        "path"=>$path,
+        "alias"=>$alias,
+        "database"=>$database === "true",
+        "migrate"=>$migrate === "true",
+        "doctor"=>$doctor !== "false"
+      ];
+    }
+    ksort($projects);
+    echo json_encode(["projects"=>$projects], JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES), PHP_EOL;
+  ' "$tmp"
+  local rc=$?
+  rm -f "$tmp"
+  return "$rc"
+}
+
+project_registry_count_json() {
+  "$(active_php_bin)" -r '
+    $j=json_decode(stream_get_contents(STDIN), true);
+    echo is_array($j["projects"] ?? null) ? count($j["projects"]) : 0;
+  '
+}
+
+project_registry_write_atomic() {
+  local json="$1"
+  local dir tmp
+  dir="$(dirname "$PROJECTS_FILE")"
+  mkdir -p "$dir"
+  tmp="$(mktemp "${PROJECTS_FILE}.tmp.XXXXXX")"
+  printf '%s\n' "$json" > "$tmp"
+
+  "$(active_php_bin)" -r '
+    $j=json_decode(file_get_contents($argv[1]), true);
+    if (!is_array($j) || !isset($j["projects"]) || !is_array($j["projects"])) exit(2);
+  ' "$tmp" || { rm -f "$tmp"; die "Refusing to write invalid project registry"; }
+
+  chmod 600 "$tmp" 2>/dev/null || true
+  mv "$tmp" "$PROJECTS_FILE"
+}
+
+project_registry_recover_if_missing() {
+  [[ ! -f "$PROJECTS_FILE" ]] || return 0
+
+  local json count
+  json="$(project_recovery_json)"
+  count="$(printf '%s\n' "$json" | project_registry_count_json)"
+
+  if [[ "$count" -gt 0 ]]; then
+    warn "Project registry is missing; rebuilding it from committed .tembeek/local.yaml manifests"
+    project_registry_write_atomic "$json"
+    ok "Recovered $count project(s) into $PROJECTS_FILE"
+    return 0
+  fi
+
+  return 1
+}
+
+cmd_project_roots_show() {
+  [[ $# -eq 0 ]] || die "Usage: tembeek-local project roots"
+
+  bold "Project discovery roots"
+  echo "Source: $(project_roots_source)"
+  echo
+
+  local root
+  while IFS= read -r root; do
+    if [[ -d "$root" ]]; then
+      printf '  %s\n' "$root"
+    else
+      printf '  %s  (missing)\n' "$root"
+    fi
+  done < <(project_recovery_roots)
+}
+
+cmd_project_roots_set() {
+  [[ $# -ge 1 ]] || die "Usage: tembeek-local project roots set <root> [root ...]"
+
+  local joined="" root canonical
+  for root in "$@"; do
+    canonical="$(canonical_project_root "$root")"
+    if [[ -z "$joined" ]]; then
+      joined="$canonical"
+    else
+      case ":$joined:" in
+        *":$canonical:"*) : ;;
+        *) joined="${joined}:$canonical" ;;
+      esac
+    fi
+  done
+
+  save_machine_project_roots "$joined"
+  ok "Saved project discovery roots"
+  echo "Config: $CONFIG_FILE"
+  cmd_project_roots_show
+}
+
+cmd_project_roots_add() {
+  [[ $# -eq 1 ]] || die "Usage: tembeek-local project roots add <root>"
+
+  local canonical current
+  canonical="$(canonical_project_root "$1")"
+  current="$(effective_project_roots_value)"
+
+  case ":$current:" in
+    *":$canonical:"*)
+      ok "Project root already configured: $canonical"
+      ;;
+    *)
+      save_machine_project_roots "${current:+$current:}$canonical"
+      ok "Added project discovery root: $canonical"
+      ;;
+  esac
+}
+
+cmd_project_roots_remove() {
+  [[ $# -eq 1 ]] || die "Usage: tembeek-local project roots remove <root>"
+
+  local target current result="" root
+  target="$1"
+  if [[ -d "$target" ]]; then
+    target="$(cd "$target" && pwd -P)"
+  fi
+
+  current="$(effective_project_roots_value)"
+  while IFS= read -r root; do
+    [[ "$root" == "$target" ]] && continue
+    result="${result:+$result:}$root"
+  done < <(printf '%s\n' "$current" | tr ':' '\n' | awk 'NF')
+
+  [[ -n "$result" ]] || die "Refusing to remove the last project discovery root; use 'project roots set <root>' instead"
+
+  save_machine_project_roots "$result"
+  ok "Removed project discovery root: $target"
+}
+
+cmd_project_roots() {
+  local action="${1:-}"
+  if [[ $# -gt 0 ]]; then shift; fi
+
+  case "$action" in
+    "")      cmd_project_roots_show "$@" ;;
+    show|ls|list) cmd_project_roots_show "$@" ;;
+    set)     cmd_project_roots_set "$@" ;;
+    add)     cmd_project_roots_add "$@" ;;
+    remove|rm) cmd_project_roots_remove "$@" ;;
+    *) die "Usage: tembeek-local project roots [show|set <root...>|add <root>|remove <root>]" ;;
+  esac
+}
+
+cmd_project_discover() {
+  [[ $# -eq 0 ]] || die "Usage: tembeek-local project discover"
+
+  bold "Discovered local projects"
+  echo "Scanning:"
+  local scan_root
+  while IFS= read -r scan_root; do
+    if [[ -d "$scan_root" ]]; then
+      printf '  %s\n' "$scan_root"
+    else
+      printf '  %s  (missing)\n' "$scan_root"
+    fi
+  done < <(project_recovery_roots)
+  echo
+
+  local tsv count=0
+  tsv="$(project_recovery_scan_tsv)"
+
+  if [[ -z "$tsv" ]]; then
+    warn "No .tembeek/local.yaml manifests found under configured project roots"
+    echo "Configure roots with: tembeek-local project roots set <root> [root ...]"
+    return 0
+  fi
+
+  printf '%-22s %-22s %s\n' "KEY" "ALIAS" "PATH"
+  while IFS=$'\t' read -r key path alias database migrate doctor; do
+    printf '%-22s %-22s %s\n' "$key" "${alias}.localhost" "$path"
+    count=$((count+1))
+  done <<< "$tsv"
+
+  echo
+  ok "Discovered $count project(s)"
+}
+
+cmd_project_registry_rebuild() {
+  [[ $# -eq 0 ]] || die "Usage: tembeek-local project registry rebuild"
+
+  local json count backup=""
+  json="$(project_recovery_json)"
+  count="$(printf '%s\n' "$json" | project_registry_count_json)"
+
+  if [[ -f "$PROJECTS_FILE" ]]; then
+    backup="${PROJECTS_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+    cp "$PROJECTS_FILE" "$backup"
+    chmod 600 "$backup" 2>/dev/null || true
+  fi
+
+  project_registry_write_atomic "$json"
+
+  bold "Project registry rebuilt"
+  ok "Registry: $PROJECTS_FILE"
+  ok "Projects: $count"
+  [[ -n "$backup" ]] && ok "Previous registry backup: $backup"
+}
+
+cmd_project_registry_verify() {
+  [[ $# -eq 0 ]] || die "Usage: tembeek-local project registry verify"
+
+  if [[ ! -f "$PROJECTS_FILE" ]]; then
+    fail "Project registry is missing: $PROJECTS_FILE"
+    echo "Recover it with: tembeek-local project registry rebuild"
+    return 1
+  fi
+
+  local expected current
+  expected="$(project_recovery_json)"
+  current="$("$(active_php_bin)" -r '
+    $j=json_decode(file_get_contents($argv[1]), true);
+    if (!is_array($j) || !is_array($j["projects"] ?? null)) exit(2);
+    ksort($j["projects"]);
+    echo json_encode(["projects"=>$j["projects"]], JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES), PHP_EOL;
+  ' "$PROJECTS_FILE" 2>/dev/null)" || {
+    fail "Project registry is invalid JSON: $PROJECTS_FILE"
+    echo "Recover it with: tembeek-local project registry rebuild"
+    return 1
+  }
+
+  if [[ "$current" == "$expected" ]]; then
+    ok "Project registry matches committed project manifests"
+    return 0
+  fi
+
+  warn "Project registry differs from recoverable manifest state"
+  echo "Run: tembeek-local project registry rebuild"
+  return 1
+}
+
+cmd_project_registry() {
+  local action="${1:-}"
+  shift || true
+  case "$action" in
+    rebuild) cmd_project_registry_rebuild "$@" ;;
+    verify)  cmd_project_registry_verify "$@" ;;
+    *) die "Usage: tembeek-local project registry <rebuild|verify>" ;;
+  esac
+}
+
 ensure_projects_file() {
   mkdir -p "$(dirname "$PROJECTS_FILE")"
+
   if [[ ! -f "$PROJECTS_FILE" ]]; then
+    project_registry_recover_if_missing && return 0
+
     cat > "$PROJECTS_FILE" <<'JSON'
 {
   "projects": {}
@@ -1744,10 +2165,24 @@ cmd_project_register() {
   validate_alias "$alias"
 
   projects_json_set "$key" "$project" "$alias"
+
+  local manifest="$project/.tembeek/local.yaml"
+  if [[ -f "$manifest" ]]; then
+    # These fields make projects.json exactly reconstructible from Git-tracked
+    # project metadata. Existing explicit values are preserved.
+    [[ -n "$(yaml_value "$manifest" registry_key 2>/dev/null || true)" ]] \
+      || yaml_set "$manifest" registry_key "$key"
+    [[ -n "$(yaml_value "$manifest" bootstrap_database 2>/dev/null || true)" ]] \
+      || yaml_set "$manifest" bootstrap_database true
+    [[ -n "$(yaml_value "$manifest" bootstrap_migrate 2>/dev/null || true)" ]] \
+      || yaml_set "$manifest" bootstrap_migrate true
+    [[ -n "$(yaml_value "$manifest" bootstrap_doctor 2>/dev/null || true)" ]] \
+      || yaml_set "$manifest" bootstrap_doctor true
+  fi
+
   ok "Registered project '$key' -> $alias.localhost"
   echo "Config: $PROJECTS_FILE"
 }
-
 
 cmd_project_deregister() {
   [[ $# -eq 1 ]] || die "Usage: tembeek-local project deregister <key>"
@@ -1768,6 +2203,9 @@ cmd_project_deregister() {
 
 cmd_project_list() {
   [[ $# -eq 0 ]] || die "Usage: tembeek-local project list"
+      tembeek-local project discover
+      tembeek-local project registry verify
+      tembeek-local project registry rebuild
   ensure_projects_file
   printf '%-20s %-20s %s\n' "KEY" "ALIAS" "PATH"
   projects_json_list
@@ -1868,11 +2306,13 @@ cmd_project() {
     deregister|unregister|remove|rm) cmd_project_deregister "$@" ;;
     setup|bootstrap) cmd_project_setup "$@" ;;
     list|ls) cmd_project_list "$@" ;;
-    "") die "Usage: tembeek-local project <register|deregister|setup|list> ..." ;;
+    discover) cmd_project_discover "$@" ;;
+    roots) cmd_project_roots "$@" ;;
+    registry) cmd_project_registry "$@" ;;
+    "") die "Usage: tembeek-local project <register|deregister|setup|list|discover|roots|registry> ..." ;;
     *) die "Unknown project action: $action" ;;
   esac
 }
-
 
 cmd_up() {
   [[ $# -eq 0 ]] || die "Usage: tembeek-local up"
