@@ -1935,3 +1935,117 @@ tembeek-local setup database
 ```
 
 Once a workstation is healthy, a new project does not need to repeat shared setup merely because it is a new shell session or repository.
+
+
+## Configuration-driven project bootstrap
+
+Shared workstation setup and project onboarding are separate concerns.
+
+The machine-level project registry defaults to:
+
+```text
+~/.config/tembeek-local/projects.json
+```
+
+Example:
+
+```json
+{
+  "projects": {
+    "rentbook": {
+      "path": "~/Development/tembeek-rent-book",
+      "alias": "rentbook",
+      "database": true,
+      "migrate": true,
+      "doctor": true
+    }
+  }
+}
+```
+
+Registering through the CLI is preferred because it resolves and validates the path:
+
+```bash
+tembeek-local project register rentbook ~/Development/tembeek-rent-book rentbook
+```
+
+Then bootstrap with one command:
+
+```bash
+tembeek-local project setup rentbook
+```
+
+The default sequence is:
+
+```text
+init
+  -> db create
+  -> db migrate
+  -> doctor
+```
+
+The JSON controls whether database creation, migration, or doctor run. The project's committed `.tembeek/local.yaml` remains authoritative for project policy, database names/users, migration command, PHP target, and shared-hosting rules. The machine JSON deliberately does not duplicate those settings.
+
+Aliases:
+
+```bash
+tembeek-local project add <key> <path> [alias]
+tembeek-local project bootstrap <key>
+```
+
+Use `tembeek-local project list` to see registered projects.
+
+
+## Deregistering a project
+
+Remove a project from the machine-level registry with:
+
+```bash
+tembeek-local project deregister <key>
+```
+
+Aliases:
+
+```bash
+tembeek-local project unregister <key>
+tembeek-local project remove <key>
+tembeek-local project rm <key>
+```
+
+Deregistration is deliberately non-destructive. It removes only the entry from:
+
+```text
+~/.config/tembeek-local/projects.json
+```
+
+It does **not** delete or alter:
+
+- the repository;
+- the `.localhost` alias symlink;
+- the project database or database user;
+- `.env`;
+- `.tembeek/local.yaml`;
+- migrations or other project files.
+
+This makes it safe for correcting registration mistakes or decommissioning a project from `tembeek-local` management without destroying project state.
+
+
+## Default local database naming
+
+When a project does not explicitly configure `database_name`, `tembeek-local` derives the local development database name from the alias:
+
+```text
+<alias>_dev
+```
+
+Examples:
+
+```text
+rentbook     -> rentbook_dev
+invoicing    -> invoicing_dev
+hotel        -> hotel_dev
+```
+
+An explicit `database_name` in `.tembeek/local.yaml` always takes precedence.
+
+This default is intentionally local-environment oriented and avoids duplicated product/company prefixes such as `tembeek_tembeek`.

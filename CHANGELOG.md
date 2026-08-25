@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.5.2
+- Changed the default generated local database name to `<alias>_dev`.
+- Explicit `database_name` in `.tembeek/local.yaml` still takes precedence.
+- Avoids awkward duplicated defaults such as `tembeek_tembeek`.
+
+
+## 1.5.1
+- Added `project deregister <key>`.
+- Added aliases: `project unregister`, `project remove`, and `project rm`.
+- Deregistration removes only the machine-level `projects.json` entry.
+- Repository, alias symlink, database, credentials, and project files remain untouched.
+
+
+## 1.5.0
+- Added machine-level `projects.json` registry.
+- Added `project register` / `project add`.
+- Added one-command `project setup` / `project bootstrap`.
+- Added `project list`.
+- Default project bootstrap sequence is `init -> db create -> db migrate -> doctor`.
+- Registry stores only machine mapping/orchestration; `.tembeek/local.yaml` remains authoritative for project policy and DB/migration details.
+- Added `TEMBEEK_PROJECTS_FILE` override and `config/projects.example.json`.
+
+
 ## 1.4.1
 - Added `tembeek-local setup workstation`.
 - Added `tembeek-local setup all` alias.

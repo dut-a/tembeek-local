@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.4.1"
+VERSION="1.5.2"
 
 LOCALHOST_ROOT="${TEMBEEK_LOCAL_ROOT:-$HOME/Sites/localhost}"
 DEV_ROOT="${TEMBEEK_DEV_ROOT:-$HOME/Development}"
 CONFIG_DIR="${TEMBEEK_CONFIG_DIR:-$HOME/.config/tembeek-local}"
 CONFIG_FILE="${TEMBEEK_CONFIG_FILE:-$CONFIG_DIR/config}"
+PROJECTS_FILE="${TEMBEEK_PROJECTS_FILE:-$HOME/.config/tembeek-local/projects.json}"
 HTTP_PORT="${TEMBEEK_HTTP_PORT:-}"
 PHP_FORMULA="${TEMBEEK_PHP_FORMULA:-php@8.4}"
 MYSQL_FORMULA="${TEMBEEK_MYSQL_FORMULA:-mysql@8.4}"
@@ -428,6 +429,20 @@ ${BOLD}WORKSTATION SETUP${RESET}
       Diagnose Homebrew / Apache / canonical PHP / MySQL / network ownership, including Herd conflicts.
 
 ${BOLD}PROJECTS${RESET}
+  ${CYAN}project register <key> <project-path> [alias]${RESET}
+      Add a project to the machine-level projects.json registry.
+
+  ${CYAN}project setup <key>${RESET}
+      Run the configured project bootstrap sequence: init -> db create -> db migrate -> doctor.
+
+  ${CYAN}project deregister <key>${RESET}
+      Remove only the machine-level projects.json registration. Repository, alias,
+      database, and project files are left untouched.
+      Aliases: project unregister, project remove, project rm.
+
+  ${CYAN}project list${RESET}
+      List configured project keys, aliases and repository paths.
+
   ${CYAN}init <project-path> [--alias <alias>]${RESET}
       Detect document root, create .tembeek/local.yaml when absent, bootstrap
       .env, and register the local alias.
@@ -498,13 +513,18 @@ ${BOLD}COMMON WORKFLOWS${RESET}
       tembeek-local setup network
       tembeek-local setup database
 
-  Newly cloned project:
+  Register + bootstrap a project:
+      tembeek-local project register rentbook ~/Development/tembeek-rent-book rentbook
+      tembeek-local project setup rentbook
+
+  Subsequent bootstrap/reconciliation:
+      tembeek-local project setup rentbook
+
+  Lower-level project commands remain available:
       tembeek-local init ~/Development/tembeek-rent-book --alias rentbook
-      tembeek-local policy validate rentbook
       tembeek-local db create rentbook
       tembeek-local db migrate rentbook
       tembeek-local doctor rentbook
-      tembeek-local check all rentbook
 
   Strict CI:
       tembeek-local check all rentbook --json --strict-warnings
@@ -514,6 +534,7 @@ ${BOLD}DEFAULTS${RESET}
   Development root  ${DIM}${DEV_ROOT}${RESET}
   Apache backend    ${DIM}${HTTP_PORT}${RESET}
   Machine config     ${DIM}${CONFIG_FILE}${RESET}
+  Projects registry  ${DIM}${PROJECTS_FILE}${RESET}
   PHP formula       ${DIM}${PHP_FORMULA}${RESET}
   PF config         ${DIM}${PF_CONF}${RESET}
   PF anchor         ${DIM}${PF_ANCHOR_NAME}${RESET}
@@ -521,6 +542,7 @@ ${BOLD}DEFAULTS${RESET}
 
 ${BOLD}ENVIRONMENT OVERRIDES${RESET}
   TEMBEEK_LOCAL_ROOT
+  TEMBEEK_PROJECTS_FILE
   TEMBEEK_DEV_ROOT
   TEMBEEK_HTTP_PORT
   TEMBEEK_PHP_FORMULA
@@ -1337,6 +1359,180 @@ cmd_setup_apache() {
 }
 
 
+
+ensure_projects_file() {
+  mkdir -p "$(dirname "$PROJECTS_FILE")"
+  if [[ ! -f "$PROJECTS_FILE" ]]; then
+    cat > "$PROJECTS_FILE" <<'JSON'
+{
+  "projects": {}
+}
+JSON
+    chmod 600 "$PROJECTS_FILE" 2>/dev/null || true
+  fi
+}
+
+projects_json_get() {
+  local key="$1" field="$2"
+  ensure_projects_file
+  "$(active_php_bin)" -r '
+    $file=$argv[1]; $key=$argv[2]; $field=$argv[3];
+    $j=json_decode(file_get_contents($file), true);
+    if (!is_array($j)) exit(2);
+    $v=$j["projects"][$key][$field] ?? null;
+    if (is_bool($v)) echo $v ? "true" : "false";
+    elseif ($v !== null) echo $v;
+  ' "$PROJECTS_FILE" "$key" "$field"
+}
+
+projects_json_has() {
+  local key="$1"
+  ensure_projects_file
+  "$(active_php_bin)" -r '
+    $j=json_decode(file_get_contents($argv[1]), true);
+    exit(isset($j["projects"][$argv[2]]) ? 0 : 1);
+  ' "$PROJECTS_FILE" "$key"
+}
+
+projects_json_set() {
+  local key="$1" path="$2" alias="$3"
+  ensure_projects_file
+  "$(active_php_bin)" -r '
+    $file=$argv[1]; $key=$argv[2]; $path=$argv[3]; $alias=$argv[4];
+    $j=json_decode(file_get_contents($file), true);
+    if (!is_array($j)) $j=[];
+    if (!isset($j["projects"]) || !is_array($j["projects"])) $j["projects"]=[];
+    $j["projects"][$key]=[
+      "path"=>$path,
+      "alias"=>$alias,
+      "database"=>true,
+      "migrate"=>true,
+      "doctor"=>true
+    ];
+    ksort($j["projects"]);
+    $out=json_encode($j, JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES).PHP_EOL;
+    if (file_put_contents($file, $out) === false) exit(3);
+  ' "$PROJECTS_FILE" "$key" "$path" "$alias"
+}
+
+
+projects_json_delete() {
+  local key="$1"
+  ensure_projects_file
+  "$(active_php_bin)" -r '
+    $file=$argv[1]; $key=$argv[2];
+    $j=json_decode(file_get_contents($file), true);
+    if (!is_array($j)) exit(2);
+    if (!isset($j["projects"]) || !array_key_exists($key, $j["projects"])) exit(4);
+    unset($j["projects"][$key]);
+    ksort($j["projects"]);
+    $out=json_encode($j, JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES).PHP_EOL;
+    if (file_put_contents($file, $out) === false) exit(3);
+  ' "$PROJECTS_FILE" "$key"
+}
+
+projects_json_list() {
+  ensure_projects_file
+  "$(active_php_bin)" -r '
+    $j=json_decode(file_get_contents($argv[1]), true);
+    foreach (($j["projects"] ?? []) as $k=>$v) {
+      printf("%-20s %-20s %s\n", $k, $v["alias"] ?? "", $v["path"] ?? "");
+    }
+  ' "$PROJECTS_FILE"
+}
+
+cmd_project_register() {
+  [[ $# -ge 2 && $# -le 3 ]] || die "Usage: tembeek-local project register <key> <project-path> [alias]"
+  local key="$1" project="$2" alias="${3:-$1}"
+
+  project="$(cd "$project" 2>/dev/null && pwd -P)" || die "Project directory not found: $project"
+  alias="$(normalize_alias "$alias")"
+  validate_alias "$alias"
+
+  projects_json_set "$key" "$project" "$alias"
+  ok "Registered project '$key' -> $alias.localhost"
+  echo "Config: $PROJECTS_FILE"
+}
+
+
+cmd_project_deregister() {
+  [[ $# -eq 1 ]] || die "Usage: tembeek-local project deregister <key>"
+  local key="$1" alias path
+
+  projects_json_has "$key" || die "Project '$key' is not registered."
+
+  alias="$(projects_json_get "$key" alias)"
+  path="$(projects_json_get "$key" path)"
+
+  projects_json_delete "$key" || die "Failed to deregister project '$key'."
+
+  ok "Deregistered project '$key'"
+  [[ -n "$alias" ]] && echo "Alias mapping left untouched: ${alias}.localhost"
+  [[ -n "$path" ]] && echo "Repository left untouched: $path"
+  echo "Database and project files were not changed."
+}
+
+cmd_project_list() {
+  [[ $# -eq 0 ]] || die "Usage: tembeek-local project list"
+  ensure_projects_file
+  printf '%-20s %-20s %s\n' "KEY" "ALIAS" "PATH"
+  projects_json_list
+}
+
+cmd_project_setup() {
+  [[ $# -eq 1 ]] || die "Usage: tembeek-local project setup <key>"
+  local key="$1" project alias do_database do_migrate do_doctor
+
+  projects_json_has "$key" || die "Unknown project '$key'. Register it first with: tembeek-local project register <key> <path> [alias]"
+
+  project="$(projects_json_get "$key" path)"
+  alias="$(projects_json_get "$key" alias)"
+  do_database="$(projects_json_get "$key" database)"
+  do_migrate="$(projects_json_get "$key" migrate)"
+  do_doctor="$(projects_json_get "$key" doctor)"
+
+  [[ -n "$project" && -d "$project" ]] || die "Configured project path does not exist: ${project:-missing}"
+  [[ -n "$alias" ]] || die "Configured alias is missing for project '$key'"
+
+  bold "Project bootstrap: $key"
+  echo "Path:  $project"
+  echo "Alias: $alias.localhost"
+  echo
+
+  cmd_init "$project" --alias "$alias"
+
+  if [[ "$do_database" != "false" ]]; then
+    echo
+    cmd_db_create "$alias"
+  fi
+
+  if [[ "$do_migrate" != "false" ]]; then
+    echo
+    cmd_db_migrate "$alias"
+  fi
+
+  if [[ "$do_doctor" != "false" ]]; then
+    echo
+    doctor "$alias"
+  fi
+
+  echo
+  ok "Project bootstrap complete: $key"
+}
+
+cmd_project() {
+  local action="${1:-}"
+  shift || true
+  case "$action" in
+    register|add) cmd_project_register "$@" ;;
+    deregister|unregister|remove|rm) cmd_project_deregister "$@" ;;
+    setup|bootstrap) cmd_project_setup "$@" ;;
+    list|ls) cmd_project_list "$@" ;;
+    "") die "Usage: tembeek-local project <register|deregister|setup|list> ..." ;;
+    *) die "Unknown project action: $action" ;;
+  esac
+}
+
 cmd_setup_workstation() {
   [[ $# -eq 0 ]] || die "Usage: tembeek-local setup workstation"
 
@@ -1813,8 +2009,7 @@ safe_db_identifier() {
 
 default_database_name() {
   local alias="$1"
-  local clean="${alias//-/_}"
-  printf 'tembeek_%s' "$clean"
+  printf '%s_dev\n' "$alias"
 }
 
 default_database_user() {
@@ -3353,6 +3548,7 @@ main() {
     db)          cmd_db "$@" ;;
     check)       cmd_check "$@" ;;
     policy)      cmd_policy "$@" ;;
+    project)     cmd_project "$@" ;;
     add)         cmd_add "$@" ;;
     remove|rm)   cmd_remove "$@" ;;
     list|ls)     cmd_list "$@" ;;

@@ -1,0 +1,18 @@
+{
+  "projects": {
+    "rentbook": {
+      "path": "~/Development/tembeek-rent-book",
+      "alias": "rentbook",
+      "database": true,
+      "migrate": true,
+      "doctor": true
+    },
+    "next-project": {
+      "path": "~/Development/tembeek-next-project",
+      "alias": "next-project",
+      "database": true,
+      "migrate": true,
+      "doctor": true
+    }
+  }
+}
