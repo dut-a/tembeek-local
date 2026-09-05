@@ -63,7 +63,7 @@ test-regression:
 	for test_file in $(REGRESSION_TESTS); do \
 	  printf '\n\033[36m→ %s\033[0m\n' "$$test_file"; \
 	  case "$$(basename "$$test_file")" in \
-	    help-style-regression-v1.8.3.sh|help-readme-sync-v1.8.1.sh|project-roots-config-v1.8.2.sh|node-project-proxy-regression-v1.9.0.sh|node-project-lifecycle-regression-v1.9.1.sh|install-regression-v1.9.2.sh|install-same-file-regression-v1.9.3.sh) \
+	    help-style-regression-v1.8.3.sh|help-readme-sync-v1.8.1.sh|project-roots-config-v1.8.2.sh|node-project-proxy-regression-v1.9.0.sh|node-project-lifecycle-regression-v1.9.1.sh|install-regression-v1.9.2.sh|install-same-file-regression-v1.9.3.sh|help-color-regression-v1.9.4.sh|install-path-isolation-regression-v1.9.5.sh) \
 	      bash "$$test_file" "$(CLI)" "$(README)" ;; \
 	    *) \
 	      bash "$$test_file" "$(CLI)" ;; \
@@ -81,7 +81,7 @@ test-all-tests:
 	for test_file in $(ALL_SHELL_TESTS); do \
 	  printf '\n\033[36m→ %s\033[0m\n' "$$test_file"; \
 	  case "$$(basename "$$test_file")" in \
-	    help-style-regression-v1.8.3.sh|help-readme-sync-v1.8.1.sh|project-roots-config-v1.8.2.sh|node-project-proxy-regression-v1.9.0.sh|node-project-lifecycle-regression-v1.9.1.sh|install-regression-v1.9.2.sh|install-same-file-regression-v1.9.3.sh) \
+	    help-style-regression-v1.8.3.sh|help-readme-sync-v1.8.1.sh|project-roots-config-v1.8.2.sh|node-project-proxy-regression-v1.9.0.sh|node-project-lifecycle-regression-v1.9.1.sh|install-regression-v1.9.2.sh|install-same-file-regression-v1.9.3.sh|help-color-regression-v1.9.4.sh|install-path-isolation-regression-v1.9.5.sh) \
 	      bash "$$test_file" "$(CLI)" "$(README)" ;; \
 	    *) \
 	      bash "$$test_file" "$(CLI)" ;; \
@@ -102,29 +102,34 @@ list-tests:
 
 install-check:
 	@set -e; \
+	target_short="$(BINDIR)/$(SHORT_NAME)"; \
+	target_canonical="$(BINDIR)/$(CANONICAL_NAME)"; \
 	printf '\033[1m== Install check ==\033[0m\n'; \
-	printf '  Canonical: %s/%s\n' "$(BINDIR)" "$(CANONICAL_NAME)"; \
-	printf '  Short:     %s/%s -> %s\n' "$(BINDIR)" "$(SHORT_NAME)" "$(CANONICAL_NAME)"; \
-	if command -v "$(SHORT_NAME)" >/dev/null 2>&1; then \
-	  existing="$$(command -v "$(SHORT_NAME)")"; \
-	  expected="$(BINDIR)/$(SHORT_NAME)"; \
-	  if [[ "$$existing" == "$$expected" && -L "$$expected" ]]; then \
-	    target="$$(readlink "$$expected")"; \
-	    if [[ "$$target" == "$(CANONICAL_NAME)" || "$$target" == "$(BINDIR)/$(CANONICAL_NAME)" ]]; then \
-	      printf '  ✓ Existing tl belongs to this installation\n'; \
-	    else \
-	      printf '  ! Collision: tl resolves to unrelated symlink %s -> %s\n' "$$existing" "$$target"; \
-	      exit 2; \
-	    fi; \
+	printf '  Canonical: %s\n' "$$target_canonical"; \
+	printf '  Short:     %s -> %s\n' "$$target_short" "$(CANONICAL_NAME)"; \
+	if [[ -e "$$target_canonical" && "$(CURDIR)/$(CLI)" -ef "$$target_canonical" ]]; then \
+	  printf '  ✓ Canonical source and destination are already the same file\n'; \
+	fi; \
+	if [[ -L "$$target_short" ]]; then \
+	  target="$$(readlink "$$target_short")"; \
+	  if [[ "$$target" == "$(CANONICAL_NAME)" || "$$target" == "$$target_canonical" ]]; then \
+	    printf '  ✓ Destination tl already belongs to this installation\n'; \
 	  else \
-	    printf '  ! Collision: tl already resolves to %s\n' "$$existing"; \
+	    printf '  ! Collision at destination: %s -> %s\n' "$$target_short" "$$target"; \
 	    exit 2; \
 	  fi; \
+	elif [[ -e "$$target_short" ]]; then \
+	  printf '  ! Collision at destination: %s already exists\n' "$$target_short"; \
+	  exit 2; \
 	else \
-	  printf '  ✓ Short command tl is available\n'; \
-	fi
-	@if [[ -e "$(BINDIR)/$(CANONICAL_NAME)" && "$(CURDIR)/$(CLI)" -ef "$(BINDIR)/$(CANONICAL_NAME)" ]]; then \
-	  printf '  ✓ Canonical source and destination are already the same file\n'; \
+	  printf '  ✓ Destination short command is available\n'; \
+	fi; \
+	if command -v "$(SHORT_NAME)" >/dev/null 2>&1; then \
+	  resolved="$$(command -v "$(SHORT_NAME)")"; \
+	  if [[ "$$resolved" != "$$target_short" ]]; then \
+	    printf '  ! Note: PATH currently resolves `%s` to %s\n' "$(SHORT_NAME)" "$$resolved"; \
+	    printf '    This does not block installation into %s.\n' "$(BINDIR)"; \
+	  fi; \
 	fi
 
 install-dry-run:
@@ -136,22 +141,20 @@ install-dry-run:
 install:
 	@set -e; \
 	mkdir -p "$(BINDIR)"; \
-	if command -v "$(SHORT_NAME)" >/dev/null 2>&1; then \
-	  existing="$$(command -v "$(SHORT_NAME)")"; \
-	  expected="$(BINDIR)/$(SHORT_NAME)"; \
-	  if [[ "$$existing" == "$$expected" && -L "$$expected" ]]; then \
-	    target="$$(readlink "$$expected")"; \
-	    if [[ "$$target" != "$(CANONICAL_NAME)" && "$$target" != "$(BINDIR)/$(CANONICAL_NAME)" ]]; then \
-	      printf '\033[31m✗ Refusing to overwrite unrelated tl: %s -> %s\033[0m\n' "$$expected" "$$target" >&2; \
-	      exit 2; \
-	    fi; \
-	  else \
-	    printf '\033[31m✗ Refusing to overwrite unrelated tl: %s\033[0m\n' "$$existing" >&2; \
+	target_short="$(BINDIR)/$(SHORT_NAME)"; \
+	target_canonical="$(BINDIR)/$(CANONICAL_NAME)"; \
+	if [[ -L "$$target_short" ]]; then \
+	  target="$$(readlink "$$target_short")"; \
+	  if [[ "$$target" != "$(CANONICAL_NAME)" && "$$target" != "$$target_canonical" ]]; then \
+	    printf '\033[31m✗ Refusing to overwrite unrelated tl at destination: %s -> %s\033[0m\n' "$$target_short" "$$target" >&2; \
 	    exit 2; \
 	  fi; \
+	elif [[ -e "$$target_short" ]]; then \
+	  printf '\033[31m✗ Refusing to overwrite unrelated tl at destination: %s\033[0m\n' "$$target_short" >&2; \
+	  exit 2; \
 	fi; \
 	source_file="$(CURDIR)/$(CLI)"; \
-	dest_file="$(BINDIR)/$(CANONICAL_NAME)"; \
+	dest_file="$$target_canonical"; \
 	if [[ -e "$$dest_file" && "$$source_file" -ef "$$dest_file" ]]; then \
 	  chmod "$(INSTALL_MODE)" "$$dest_file"; \
 	  printf '\033[32m✓ Canonical command already installed at %s\033[0m\n' "$$dest_file"; \
@@ -159,9 +162,15 @@ install:
 	  install -m "$(INSTALL_MODE)" "$(CLI)" "$$dest_file"; \
 	  printf '\033[32m✓ Installed %s\033[0m\n' "$$dest_file"; \
 	fi; \
-	rm -f "$(BINDIR)/$(SHORT_NAME)"; \
-	ln -s "$(CANONICAL_NAME)" "$(BINDIR)/$(SHORT_NAME)"; \
-	printf '\033[32m✓ Installed short command: %s\033[0m\n' "$(BINDIR)/$(SHORT_NAME)"; \
+	rm -f "$$target_short"; \
+	ln -s "$(CANONICAL_NAME)" "$$target_short"; \
+	printf '\033[32m✓ Installed short command: %s\033[0m\n' "$$target_short"; \
+	if command -v "$(SHORT_NAME)" >/dev/null 2>&1; then \
+	  resolved="$$(command -v "$(SHORT_NAME)")"; \
+	  if [[ "$$resolved" != "$$target_short" ]]; then \
+	    printf '\033[33m! PATH currently resolves `%s` to %s, not the new %s\033[0m\n' "$(SHORT_NAME)" "$$resolved" "$$target_short"; \
+	  fi; \
+	fi; \
 	printf '\nTry:\n  tembeek-local --help\n  tl --help\n'
 
 uninstall:

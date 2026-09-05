@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.9.3"
+VERSION="1.9.5"
 
 LOCALHOST_ROOT="${TEMBEEK_LOCAL_ROOT:-$HOME/Sites/localhost}"
 DEV_ROOT="${TEMBEEK_DEV_ROOT:-$HOME/Development}"
@@ -456,12 +456,12 @@ mysql_runtime_description() {
 }
 
 usage() {
-  local BOLD RESET DIM CYAN GREEN YELLOW
+  local BOLD RESET DIM CYAN GREEN YELLOW BLUE MAGENTA
   if [[ -t 1 ]]; then
     BOLD=$'\033[1m'; RESET=$'\033[0m'; DIM=$'\033[2m'
-    CYAN=$'\033[36m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'
+    CYAN=$'\033[36m'; GREEN=$'\033[32m'; YELLOW=$'\033[33m'; BLUE=$'\033[34m'; MAGENTA=$'\033[35m'
   else
-    BOLD=""; RESET=""; DIM=""; CYAN=""; GREEN=""; YELLOW=""
+    BOLD=""; RESET=""; DIM=""; CYAN=""; GREEN=""; YELLOW=""; BLUE=""; MAGENTA=""
   fi
 
   cat <<EOF
@@ -608,115 +608,118 @@ ${BOLD}NETWORK REMOVAL${RESET}
       Remove Tembeek's launchd/PF forwarding; Apache remains available on :${HTTP_PORT}.
 
 ${BOLD}COMMON WORKFLOWS${RESET}
-  New workstation:
-      tembeek-local setup workstation
-      tembeek-local doctor
+  ${MAGENTA}New workstation${RESET}
+      ${CYAN}tembeek-local setup workstation${RESET}
+      ${CYAN}tembeek-local doctor${RESET}
 
-  Targeted shared-infrastructure repair:
-      tembeek-local setup apache
-      tembeek-local setup network
-      tembeek-local setup database
+  ${MAGENTA}Targeted shared-infrastructure repair${RESET}
+      ${CYAN}tembeek-local setup apache${RESET}
+      ${CYAN}tembeek-local setup network${RESET}
+      ${CYAN}tembeek-local setup database${RESET}
 
-  Configure discovery roots:
-      tembeek-local project roots set ~/dev/code ~/Development
-      tembeek-local project roots
-      tembeek-local project discover
+  ${MAGENTA}Configure discovery roots${RESET}
+      ${CYAN}tembeek-local project roots set ~/dev/code ~/Development${RESET}
+      ${CYAN}tembeek-local project roots${RESET}
+      ${CYAN}tembeek-local project discover${RESET}
 
-  Recover the machine project registry:
-      tembeek-local project registry verify
-      tembeek-local project registry rebuild
+  ${MAGENTA}Recover the machine project registry${RESET}
+      ${CYAN}tembeek-local project registry verify${RESET}
+      ${CYAN}tembeek-local project registry rebuild${RESET}
 
-  Register + bootstrap a project:
-      tembeek-local project register rentbook ~/Development/tembeek-rent-book rentbook
-      tembeek-local project setup rentbook
+  ${MAGENTA}Register + bootstrap a project${RESET}
+      ${CYAN}tembeek-local project register rentbook ~/Development/tembeek-rent-book rentbook${RESET}
+      ${CYAN}tembeek-local project setup rentbook${RESET}
 
-  Subsequent bootstrap/reconciliation:
-      tembeek-local project setup rentbook
+  ${MAGENTA}Subsequent bootstrap / reconciliation${RESET}
+      ${CYAN}tembeek-local project setup rentbook${RESET}
 
-  Process-backed project lifecycle:
-      tembeek-local project up mysite
-      tembeek-local project restart mysite
-      tembeek-local project autostart mysite on
-      tembeek-local project status mysite
-      tembeek-local project down mysite
+  ${MAGENTA}Process-backed project lifecycle${RESET}
+      ${CYAN}tembeek-local project up mysite${RESET}
+      ${CYAN}tembeek-local project restart mysite${RESET}
+      ${CYAN}tembeek-local project autostart mysite on${RESET}
+      ${CYAN}tembeek-local project status mysite${RESET}
+      ${CYAN}tembeek-local project down mysite${RESET}
 
-  Lower-level project commands remain available:
-      tembeek-local init ~/Development/tembeek-rent-book --alias rentbook
-      tembeek-local db create rentbook
-      tembeek-local db migrate rentbook
-      tembeek-local doctor rentbook
+  ${MAGENTA}Lower-level project commands${RESET}
+      ${CYAN}tembeek-local init ~/Development/tembeek-rent-book --alias rentbook${RESET}
+      ${CYAN}tembeek-local db create rentbook${RESET}
+      ${CYAN}tembeek-local db migrate rentbook${RESET}
+      ${CYAN}tembeek-local doctor rentbook${RESET}
 
-  Strict CI:
-      tembeek-local check all rentbook --json --strict-warnings
+  ${MAGENTA}Strict CI${RESET}
+      ${CYAN}tembeek-local check all rentbook --json --strict-warnings${RESET}
 
 ${BOLD}DEFAULTS${RESET}
-  Alias registry     ${DIM}${LOCALHOST_ROOT}${RESET}
-  Development root  ${DIM}${DEV_ROOT}${RESET}
-  Project roots     ${DIM}$(effective_project_roots_value)${RESET}
-  Apache HTTP       ${DIM}${HTTP_PORT}${RESET}
-  Apache HTTPS      ${DIM}${HTTPS_PORT}${RESET}
-  Machine config     ${DIM}${CONFIG_FILE}${RESET}
-  Projects registry  ${DIM}${PROJECTS_FILE}${RESET}
-  PHP formula       ${DIM}${PHP_FORMULA}${RESET}
-  PF config         ${DIM}${PF_CONF}${RESET}
-  PF anchor         ${DIM}${PF_ANCHOR_NAME}${RESET}
-  MySQL admin       ${DIM}${MYSQL_ADMIN_USER}@${MYSQL_ADMIN_HOST}:${MYSQL_ADMIN_PORT}${RESET}
+  ${BLUE}Alias registry${RESET}      ${GREEN}${LOCALHOST_ROOT}${RESET}
+  ${BLUE}Development root${RESET}   ${GREEN}${DEV_ROOT}${RESET}
+  ${BLUE}Project roots${RESET}      ${GREEN}$(effective_project_roots_value)${RESET}
+  ${BLUE}Apache HTTP${RESET}        ${GREEN}${HTTP_PORT}${RESET}
+  ${BLUE}Apache HTTPS${RESET}       ${GREEN}${HTTPS_PORT}${RESET}
+  ${BLUE}Machine config${RESET}     ${GREEN}${CONFIG_FILE}${RESET}
+  ${BLUE}Projects registry${RESET}  ${GREEN}${PROJECTS_FILE}${RESET}
+  ${BLUE}PHP formula${RESET}        ${GREEN}${PHP_FORMULA}${RESET}
+  ${BLUE}PF config${RESET}          ${GREEN}${PF_CONF}${RESET}
+  ${BLUE}PF anchor${RESET}          ${GREEN}${PF_ANCHOR_NAME}${RESET}
+  ${BLUE}MySQL admin${RESET}        ${GREEN}${MYSQL_ADMIN_USER}@${MYSQL_ADMIN_HOST}:${MYSQL_ADMIN_PORT}${RESET}
 
 ${BOLD}ENVIRONMENT OVERRIDES${RESET}
-  TEMBEEK_LOCAL_ROOT
-  TEMBEEK_PROJECTS_FILE
-  TEMBEEK_DEV_ROOT
-  TEMBEEK_PROJECT_ROOTS
-  TEMBEEK_NODE_PORT_MIN=43000
-  TEMBEEK_NODE_PORT_MAX=43999
-  TEMBEEK_PROCESS_DIR
-  TEMBEEK_APACHE_PROXY_DIR
-  TEMBEEK_HTTP_PORT
-  TEMBEEK_HTTPS_PORT
-  TEMBEEK_TLS_DIR
-  TEMBEEK_PHP_FORMULA
-  TEMBEEK_MYSQL_FORMULA=mysql@8.4
-  TEMBEEK_PF_CONF
-  TEMBEEK_PF_ANCHOR_NAME
-  TEMBEEK_PF_ANCHOR_FILE
-  TEMBEEK_MYSQL_ADMIN_USER
-  TEMBEEK_MYSQL_ADMIN_HOST
-  TEMBEEK_MYSQL_ADMIN_PORT
-  TEMBEEK_MYSQL_ADMIN_PASSWORD
+  ${CYAN}TEMBEEK_LOCAL_ROOT${RESET}
+  ${CYAN}TEMBEEK_PROJECTS_FILE${RESET}
+  ${CYAN}TEMBEEK_DEV_ROOT${RESET}
+  ${CYAN}TEMBEEK_PROJECT_ROOTS${RESET}
+  ${CYAN}TEMBEEK_NODE_PORT_MIN${RESET}${DIM}=43000${RESET}
+  ${CYAN}TEMBEEK_NODE_PORT_MAX${RESET}${DIM}=43999${RESET}
+  ${CYAN}TEMBEEK_PROCESS_DIR${RESET}
+  ${CYAN}TEMBEEK_APACHE_PROXY_DIR${RESET}
+  ${CYAN}TEMBEEK_HTTP_PORT${RESET}
+  ${CYAN}TEMBEEK_HTTPS_PORT${RESET}
+  ${CYAN}TEMBEEK_TLS_DIR${RESET}
+  ${CYAN}TEMBEEK_PHP_FORMULA${RESET}
+  ${CYAN}TEMBEEK_MYSQL_FORMULA${RESET}${DIM}=mysql@8.4${RESET}
+  ${CYAN}TEMBEEK_PF_CONF${RESET}
+  ${CYAN}TEMBEEK_PF_ANCHOR_NAME${RESET}
+  ${CYAN}TEMBEEK_PF_ANCHOR_FILE${RESET}
+  ${CYAN}TEMBEEK_MYSQL_ADMIN_USER${RESET}
+  ${CYAN}TEMBEEK_MYSQL_ADMIN_HOST${RESET}
+  ${CYAN}TEMBEEK_MYSQL_ADMIN_PORT${RESET}
+  ${CYAN}TEMBEEK_MYSQL_ADMIN_PASSWORD${RESET}
 
 ${BOLD}REGISTRY RECOVERY${RESET}
   ${DIM}projects.json is a derived machine index. If it disappears, registry-backed
   commands attempt recovery from committed .tembeek/local.yaml manifests before
-  creating an empty registry.
+  creating an empty registry.${RESET}
 
-  Discovery precedence:
-    TEMBEEK_PROJECT_ROOTS environment override
-      -> PROJECT_ROOTS in machine config
-      -> TEMBEEK_DEV_ROOT / ~/Development default${RESET}
+  ${MAGENTA}Discovery precedence${RESET}
+      ${CYAN}TEMBEEK_PROJECT_ROOTS${RESET} ${DIM}environment override${RESET}
+        ${YELLOW}↓${RESET}
+      ${CYAN}PROJECT_ROOTS${RESET} ${DIM}in machine config${RESET}
+        ${YELLOW}↓${RESET}
+      ${CYAN}TEMBEEK_DEV_ROOT${RESET} ${DIM}/ ~/Development default${RESET}
 
 ${BOLD}INSTALLATION${RESET}
-  From the repository checkout:
-      make install
-      make install-check
-      make install-dry-run
-      make uninstall
+  ${MAGENTA}From the repository checkout${RESET}
+      ${CYAN}make install${RESET}
+      ${CYAN}make install-check${RESET}
+      ${CYAN}make install-dry-run${RESET}
+      ${CYAN}make uninstall${RESET}
 
-  Default commands:
-      tembeek-local
-      tl                    Short executable alias for tembeek-local
+  ${MAGENTA}Installed commands${RESET}
+      ${GREEN}tembeek-local${RESET}   ${DIM}Canonical command${RESET}
+      ${GREEN}tl${RESET}              ${DIM}Short executable alias for tembeek-local${RESET}
 
-  Default destination:
-      ~/.local/bin/tembeek-local
-      ~/.local/bin/tl -> tembeek-local
+  ${MAGENTA}Default destination${RESET}
+      ${GREEN}~/.local/bin/tembeek-local${RESET}
+      ${GREEN}~/.local/bin/tl${RESET} ${YELLOW}→${RESET} ${GREEN}tembeek-local${RESET}
 
 ${BOLD}HELP & VERSION${RESET}
-  tembeek-local help | -h | --help
-  tembeek-local version | -v | --version
+  ${CYAN}tembeek-local help${RESET}    ${DIM}| -h | --help${RESET}
+  ${CYAN}tembeek-local version${RESET} ${DIM}| -v | --version${RESET}
 
 ${DIM}Project contract: .tembeek/local.yaml (schema_version: 1)
 See README.md for full operating and troubleshooting documentation.${RESET}
 EOF
 }
+
 
 
 normalize_alias() {

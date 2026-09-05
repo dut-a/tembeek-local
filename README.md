@@ -2653,3 +2653,30 @@ If `~/.local/bin` is not in your `PATH`, add it to your shell configuration.
 `~/.local/bin/tembeek-local` already resolve to the same file, the installer skips the
 copy that macOS/BSD `install` rejects, reconciles executable permissions, and still
 recreates `tl -> tembeek-local`.
+
+
+### Help presentation
+
+The terminal help uses semantic coloring when stdout is a TTY:
+
+- bold section headings
+- magenta workflow/subsection labels
+- cyan commands and environment-variable names
+- blue default-field labels
+- green paths, values, and installed command names
+- yellow precedence/symlink arrows
+- dim annotations and explanatory text
+
+ANSI coloring is disabled automatically for pipes, redirects, and CI logs.
+
+### Short-command collision scope
+
+Collision protection applies to the **destination** being managed, such as
+`~/.local/bin/tl`. An unrelated `tl` elsewhere in `PATH` does not block installation
+into another `PREFIX`/`BINDIR`.
+
+`make install-check` may report that another `tl` currently wins PATH resolution, but
+that is informational rather than an installation failure.
+
+Same-file detection uses Bash file identity (`-ef`), so repeated installs work
+consistently on both macOS/BSD and GNU/Linux environments.

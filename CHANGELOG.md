@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.9.5
+- Scope `tl` collision protection to the actual destination path instead of any `tl` found in PATH.
+- Allow isolated/test-prefix installs even when the user's normal shell already has a legitimate `tl`.
+- Preserve strict protection for unrelated files or symlinks at `$(BINDIR)/tl`.
+- Replace BSD/GNU `stat` same-file detection with Bash `-ef` file identity.
+- Make alternate PATH resolution informational in `install-check`.
+- Correct legacy install regressions to test destination collisions rather than global PATH collisions.
+- Add regression coverage proving an unrelated PATH `tl` cannot break `make test`.
+
+
+## 1.9.4
+- Add semantic coloring to the lower built-in help sections: workflows, defaults, environment overrides, recovery precedence, installation, and help/version.
+- Add blue and magenta to the TTY-only palette while preserving clean non-TTY output.
+- Fix the installation command block so `tembeek-local` and `tl` are both fully labeled and aligned.
+- Improve recovery precedence and symlink presentation with colored arrows.
+- Update the older install regression to assert the corrected help wording.
+- Add help-color and non-TTY regression coverage.
+
+
 ## 1.9.3
 - Make `make install` idempotent when source and destination are already the same file.
 - Use Bash `-ef` file-identity checks, avoiding macOS/Linux `stat` differences.

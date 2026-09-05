@@ -10,7 +10,9 @@ grep -Fq 'make install' "$README"
 
 HELP="$("$CLI" --help)"
 grep -Fq 'make install' <<<"$HELP"
-grep -Fq 'tl                    Short executable alias' <<<"$HELP"
+grep -Fq 'Installed commands' <<<"$HELP"
+grep -Fq 'Canonical command' <<<"$HELP"
+grep -Fq 'Short executable alias for tembeek-local' <<<"$HELP"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -23,11 +25,11 @@ make --no-print-directory install PREFIX="$TMP/prefix" >/dev/null
 "$TMP/prefix/bin/tembeek-local" --version >/dev/null
 "$TMP/prefix/bin/tl" --version >/dev/null
 
-mkdir -p "$TMP/collision/bin"
-printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/collision/bin/tl"
-chmod +x "$TMP/collision/bin/tl"
-if PATH="$TMP/collision/bin:$PATH" make --no-print-directory install PREFIX="$TMP/other" >/dev/null 2>&1; then
-  echo "expected tl collision failure" >&2
+mkdir -p "$TMP/other/bin"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP/other/bin/tl"
+chmod +x "$TMP/other/bin/tl"
+if make --no-print-directory install PREFIX="$TMP/other" >/dev/null 2>&1; then
+  echo "expected destination tl collision failure" >&2
   exit 1
 fi
 
