@@ -2503,3 +2503,55 @@ fixture becomes part of the normal test suite without editing the Makefile unles
 fixture needs special arguments.
 
 `make ci` is currently an alias for `make test`.
+
+## Process-backed Node / Astro / React projects
+
+`tembeek-local` supports two local serving models:
+
+```text
+PHP/shared-hosting project
+    Apache -> document root
+
+Astro / Vite / React / Node project
+    Apache https://alias.localhost
+        -> reverse proxy
+        -> deterministic 127.0.0.1:<dev_port>
+        -> framework dev server
+```
+
+The browser-facing URL never contains the Node dev-server port.
+
+Typical workflow:
+
+```bash
+tembeek-local project register site ~/dev/site site
+tembeek-local project setup site
+
+# afterwards
+tembeek-local project up site
+tembeek-local project status site
+tembeek-local project down site
+```
+
+Node-family manifests use fields such as:
+
+```yaml
+type: node
+framework: astro        # astro | vite | react-scripts | next | node
+runtime_mode: process-proxy
+package_manager: npm
+dev_script: dev
+dev_host: 127.0.0.1
+dev_port: 43xxx
+```
+
+`dev_port` is deterministic and persisted, so restarts keep the same backend. Vite
+projects are started with `--strictPort`; if their assigned backend port is unavailable,
+startup fails instead of silently moving to another port.
+
+Astro/Vite receive explicit `--host` and `--port` arguments. Generic Node,
+react-scripts and similar projects receive `HOST` and `PORT` environment variables.
+The dev server remains loopback-only; Apache provides the trusted HTTPS front door.
+
+Generated process state and proxy configuration live under the machine config directory,
+not inside the project repository.

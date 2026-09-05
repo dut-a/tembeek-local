@@ -51,7 +51,7 @@ test-regression:
 	for test_file in $(REGRESSION_TESTS); do \
 	  printf '\n\033[36m→ %s\033[0m\n' "$$test_file"; \
 	  case "$$(basename "$$test_file")" in \
-	    help-style-regression-v1.8.3.sh|help-readme-sync-v1.8.1.sh|project-roots-config-v1.8.2.sh) \
+	    help-style-regression-v1.8.3.sh|help-readme-sync-v1.8.1.sh|project-roots-config-v1.8.2.sh|node-project-proxy-regression-v1.9.0.sh) \
 	      bash "$$test_file" "$(CLI)" "$(README)" ;; \
 	    *) \
 	      bash "$$test_file" "$(CLI)" ;; \
@@ -69,7 +69,7 @@ test-all-tests:
 	for test_file in $(ALL_SHELL_TESTS); do \
 	  printf '\n\033[36m→ %s\033[0m\n' "$$test_file"; \
 	  case "$$(basename "$$test_file")" in \
-	    help-style-regression-v1.8.3.sh|help-readme-sync-v1.8.1.sh|project-roots-config-v1.8.2.sh) \
+	    help-style-regression-v1.8.3.sh|help-readme-sync-v1.8.1.sh|project-roots-config-v1.8.2.sh|node-project-proxy-regression-v1.9.0.sh) \
 	      bash "$$test_file" "$(CLI)" "$(README)" ;; \
 	    *) \
 	      bash "$$test_file" "$(CLI)" ;; \

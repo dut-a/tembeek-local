@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.9.0
+- Add first-class Node-family project support alongside PHP projects.
+- Detect Astro, Vite, react-scripts, Next, and generic Node projects from package.json.
+- Assign and persist deterministic loopback dev-server ports.
+- Add Apache reverse-proxy vhosts so process-backed projects remain available at `https://<alias>.localhost`.
+- Enable Apache mod_proxy + mod_proxy_http and WebSocket upgrade forwarding for HMR.
+- Add `project up`, `project down`, and `project status`.
+- Make `project setup` initialize/start process-backed Node projects instead of treating them as PHP.
+- Use strict fixed ports for Vite rather than allowing automatic port hopping.
+- Keep generated process state and proxy configuration in machine-local config.
+- Add Node/proxy regression coverage and Make integration.
+
+
 ## 1.8.4
 - Add a styled repository-level Makefile.
 - Add `make test` as the default quality entry point for Bash syntax, smoke checks, and regression tests.

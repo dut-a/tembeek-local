@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.8.4"
+VERSION="1.9.0"
 
 LOCALHOST_ROOT="${TEMBEEK_LOCAL_ROOT:-$HOME/Sites/localhost}"
 DEV_ROOT="${TEMBEEK_DEV_ROOT:-$HOME/Development}"
@@ -10,6 +10,11 @@ CONFIG_FILE="${TEMBEEK_CONFIG_FILE:-$CONFIG_DIR/config}"
 TLS_DIR="${TEMBEEK_TLS_DIR:-$CONFIG_DIR/tls}"
 TLS_CERT="${TEMBEEK_TLS_CERT:-$TLS_DIR/localhost.pem}"
 TLS_KEY="${TEMBEEK_TLS_KEY:-$TLS_DIR/localhost-key.pem}"
+PROCESS_DIR="${TEMBEEK_PROCESS_DIR:-$CONFIG_DIR/processes}"
+APACHE_PROXY_DIR="${TEMBEEK_APACHE_PROXY_DIR:-$CONFIG_DIR/apache-proxies}"
+NODE_PORT_MIN="${TEMBEEK_NODE_PORT_MIN:-43000}"
+NODE_PORT_MAX="${TEMBEEK_NODE_PORT_MAX:-43999}"
+
 PROJECTS_FILE="${TEMBEEK_PROJECTS_FILE:-$HOME/.config/tembeek-local/projects.json}"
 HTTP_PORT="${TEMBEEK_HTTP_PORT:-}"
 HTTPS_PORT="${TEMBEEK_HTTPS_PORT:-8443}"
@@ -492,7 +497,17 @@ ${BOLD}PROJECTS${RESET}
       Add a project to the machine-level projects.json registry.
 
   ${CYAN}project setup <key>${RESET}
-      Run the configured project bootstrap sequence: init -> db create -> db migrate -> doctor.
+      Bootstrap a project. PHP uses document-root + DB policy; Node-family projects
+      initialize a deterministic process backend and Apache reverse proxy.
+
+  ${CYAN}project up <key>${RESET}
+      Start a process-backed Astro/Vite/React/Node dev server on its fixed backend port.
+
+  ${CYAN}project down <key>${RESET}
+      Stop the project's process-backed dev server.
+
+  ${CYAN}project status <key>${RESET}
+      Show project type, stable URL, backend port, proxy state and process log.
 
   ${CYAN}project deregister <key>${RESET}
       Remove only the machine-level projects.json registration. Repository, alias,
@@ -639,6 +654,10 @@ ${BOLD}ENVIRONMENT OVERRIDES${RESET}
   TEMBEEK_PROJECTS_FILE
   TEMBEEK_DEV_ROOT
   TEMBEEK_PROJECT_ROOTS
+  TEMBEEK_NODE_PORT_MIN=43000
+  TEMBEEK_NODE_PORT_MAX=43999
+  TEMBEEK_PROCESS_DIR
+  TEMBEEK_APACHE_PROXY_DIR
   TEMBEEK_HTTP_PORT
   TEMBEEK_HTTPS_PORT
   TEMBEEK_TLS_DIR
@@ -894,6 +913,7 @@ write_managed_apache_conf() {
 # Managed by tembeek-local ${VERSION}
 
 LoadModule php_module "$php_module"
+IncludeOptional "${APACHE_PROXY_DIR}/*.conf"
 
 <FilesMatch "\\.php$">
     SetHandler application/x-httpd-php
@@ -1607,6 +1627,7 @@ cmd_setup_apache() {
 
   configure_php_cli
   ensure_registry
+  mkdir -p "$APACHE_PROXY_DIR"
 
   local conf managed php_module
   conf="$(httpd_conf_path)"
@@ -1637,6 +1658,10 @@ cmd_setup_apache() {
     "LoadModule vhost_alias_module lib/httpd/modules/mod_vhost_alias.so"
   replace_loadmodule_line "$conf" "ssl_module" \
     "LoadModule ssl_module lib/httpd/modules/mod_ssl.so"
+  replace_loadmodule_line "$conf" "proxy_module" \
+    "LoadModule proxy_module lib/httpd/modules/mod_proxy.so"
+  replace_loadmodule_line "$conf" "proxy_http_module" \
+    "LoadModule proxy_http_module lib/httpd/modules/mod_proxy_http.so"
 
   # Prevent duplicate php_module declarations if the user previously added one manually.
   disable_loadmodule_line "$conf" "php_module"
@@ -2158,29 +2183,42 @@ projects_json_list() {
 
 cmd_project_register() {
   [[ $# -ge 2 && $# -le 3 ]] || die "Usage: tembeek-local project register <key> <project-path> [alias]"
-  local key="$1" project="$2" alias="${3:-$1}"
+  local key="$1" project="$2" alias="${3:-$1}" type
 
   project="$(cd "$project" 2>/dev/null && pwd -P)" || die "Project directory not found: $project"
   alias="$(normalize_alias "$alias")"
   validate_alias "$alias"
+  type="$(detect_project_type "$project")"
 
   projects_json_set "$key" "$project" "$alias"
 
+  if [[ "$type" == "node" ]]; then
+    "$(active_php_bin)" -r '
+      $file=$argv[1]; $key=$argv[2];
+      $j=json_decode(file_get_contents($file), true);
+      $j["projects"][$key]["database"]=false;
+      $j["projects"][$key]["migrate"]=false;
+      $j["projects"][$key]["doctor"]=false;
+      file_put_contents($file, json_encode($j, JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES).PHP_EOL);
+    ' "$PROJECTS_FILE" "$key"
+  fi
+
   local manifest="$project/.tembeek/local.yaml"
   if [[ -f "$manifest" ]]; then
-    # These fields make projects.json exactly reconstructible from Git-tracked
-    # project metadata. Existing explicit values are preserved.
-    [[ -n "$(yaml_value "$manifest" registry_key 2>/dev/null || true)" ]] \
-      || yaml_set "$manifest" registry_key "$key"
-    [[ -n "$(yaml_value "$manifest" bootstrap_database 2>/dev/null || true)" ]] \
-      || yaml_set "$manifest" bootstrap_database true
-    [[ -n "$(yaml_value "$manifest" bootstrap_migrate 2>/dev/null || true)" ]] \
-      || yaml_set "$manifest" bootstrap_migrate true
-    [[ -n "$(yaml_value "$manifest" bootstrap_doctor 2>/dev/null || true)" ]] \
-      || yaml_set "$manifest" bootstrap_doctor true
+    [[ -n "$(yaml_value "$manifest" registry_key 2>/dev/null || true)" ]] || yaml_set "$manifest" registry_key "$key"
+    if [[ "$type" == "node" ]]; then
+      yaml_set "$manifest" bootstrap_database false
+      yaml_set "$manifest" bootstrap_migrate false
+      yaml_set "$manifest" bootstrap_doctor false
+    else
+      [[ -n "$(yaml_value "$manifest" bootstrap_database 2>/dev/null || true)" ]] || yaml_set "$manifest" bootstrap_database true
+      [[ -n "$(yaml_value "$manifest" bootstrap_migrate 2>/dev/null || true)" ]] || yaml_set "$manifest" bootstrap_migrate true
+      [[ -n "$(yaml_value "$manifest" bootstrap_doctor 2>/dev/null || true)" ]] || yaml_set "$manifest" bootstrap_doctor true
+    fi
   fi
 
   ok "Registered project '$key' -> $alias.localhost"
+  echo "Type: $type"
   echo "Config: $PROJECTS_FILE"
 }
 
@@ -2240,10 +2278,9 @@ assert_project_bootstrap_function_graph() {
 
 cmd_project_setup() {
   [[ $# -eq 1 ]] || die "Usage: tembeek-local project setup <key>"
-  local key="$1" project alias do_database do_migrate do_doctor
+  local key="$1" project alias do_database do_migrate do_doctor type
 
   assert_project_bootstrap_function_graph
-
   projects_json_has "$key" || die "Unknown project '$key'. Register it first with: tembeek-local project register <key> <path> [alias]"
 
   project="$(projects_json_get "$key" path)"
@@ -2251,6 +2288,7 @@ cmd_project_setup() {
   do_database="$(projects_json_get "$key" database)"
   do_migrate="$(projects_json_get "$key" migrate)"
   do_doctor="$(projects_json_get "$key" doctor)"
+  type="$(detect_project_type "$project")"
 
   [[ -n "$project" && -d "$project" ]] || die "Configured project path does not exist: ${project:-missing}"
   [[ -n "$alias" ]] || die "Configured alias is missing for project '$key'"
@@ -2258,10 +2296,9 @@ cmd_project_setup() {
   bold "Project bootstrap: $key"
   echo "Path:  $project"
   echo "Alias: $alias.localhost"
+  echo "Type:  $type"
   echo
 
-  # Registered aliases are explicit certificate SANs. Avoid relying on
-  # wildcard matching behavior for the special-use .localhost suffix.
   if ! local_tls_cert_has_name "${alias}.localhost"; then
     ensure_local_tls_material
     restart_or_start_httpd
@@ -2269,8 +2306,15 @@ cmd_project_setup() {
 
   cmd_init "$project" --alias "$alias"
 
-  # A migration target necessarily implies a database target. If no explicit
-  # database name exists yet, db create provisions the default <alias>_dev shell DB.
+  if [[ "$type" == "node" ]]; then
+    node_project_start "$project" "$alias"
+    restart_or_start_httpd
+    echo
+    ok "Project bootstrap complete: $key"
+    echo "URL: https://${alias}.localhost"
+    return 0
+  fi
+
   if [[ "$do_database" != "false" || "$do_migrate" != "false" ]]; then
     echo
     if [[ "$do_database" == "false" && "$do_migrate" != "false" ]]; then
@@ -2298,6 +2342,70 @@ cmd_project_setup() {
   ok "Project bootstrap complete: $key"
 }
 
+cmd_project_up() {
+  [[ $# -eq 1 ]] || die "Usage: tembeek-local project up <key>"
+  local key="$1" project alias type
+  projects_json_has "$key" || die "Unknown project '$key'"
+  project="$(projects_json_get "$key" path)"
+  alias="$(projects_json_get "$key" alias)"
+  type="$(detect_project_type "$project")"
+
+  if [[ "$type" == "node" ]]; then
+    cmd_init "$project" --alias "$alias"
+    node_project_start "$project" "$alias"
+    restart_or_start_httpd
+    ok "Project available: https://${alias}.localhost"
+  else
+    ok "PHP project is Apache-served; no project process is required"
+    echo "URL: https://${alias}.localhost"
+  fi
+}
+
+cmd_project_down() {
+  [[ $# -eq 1 ]] || die "Usage: tembeek-local project down <key>"
+  local key="$1" project alias type
+  projects_json_has "$key" || die "Unknown project '$key'"
+  project="$(projects_json_get "$key" path)"
+  alias="$(projects_json_get "$key" alias)"
+  type="$(detect_project_type "$project")"
+
+  if [[ "$type" == "node" ]]; then
+    node_project_stop "$alias"
+  else
+    ok "PHP project has no dedicated dev-server process"
+  fi
+}
+
+cmd_project_status() {
+  [[ $# -eq 1 ]] || die "Usage: tembeek-local project status <key>"
+  local key="$1" project alias type manifest port
+  projects_json_has "$key" || die "Unknown project '$key'"
+  project="$(projects_json_get "$key" path)"
+  alias="$(projects_json_get "$key" alias)"
+  type="$(detect_project_type "$project")"
+
+  bold "Project status: $key"
+  echo "Type:  $type"
+  echo "Alias: https://${alias}.localhost"
+
+  if [[ "$type" == "node" ]]; then
+    manifest="$project/.tembeek/local.yaml"
+    port="$(yaml_value "$manifest" dev_port 2>/dev/null || true)"
+    echo "Backend: http://127.0.0.1:${port:-unknown}"
+    if node_runtime_running "$alias"; then
+      ok "Dev server: UP"
+    else
+      warn "Dev server: DOWN"
+    fi
+    [[ -f "$APACHE_PROXY_DIR/${alias}.conf" ]] \
+      && ok "Apache proxy: configured" \
+      || warn "Apache proxy: missing"
+    echo "Log: $(node_runtime_log_file "$alias")"
+  else
+    ok "Serving mode: Apache document root"
+  fi
+}
+
 cmd_project() {
   local action="${1:-}"
   shift || true
@@ -2305,11 +2413,14 @@ cmd_project() {
     register|add) cmd_project_register "$@" ;;
     deregister|unregister|remove|rm) cmd_project_deregister "$@" ;;
     setup|bootstrap) cmd_project_setup "$@" ;;
+    up|start) cmd_project_up "$@" ;;
+    down|stop) cmd_project_down "$@" ;;
+    status) cmd_project_status "$@" ;;
     list|ls) cmd_project_list "$@" ;;
     discover) cmd_project_discover "$@" ;;
     roots) cmd_project_roots "$@" ;;
     registry) cmd_project_registry "$@" ;;
-    "") die "Usage: tembeek-local project <register|deregister|setup|list|discover|roots|registry> ..." ;;
+    "") die "Usage: tembeek-local project <register|deregister|setup|up|down|status|list|discover|roots|registry> ..." ;;
     *) die "Unknown project action: $action" ;;
   esac
 }
@@ -2485,9 +2596,303 @@ yaml_value() {
   ' "$file"
 }
 
+package_json_has() {
+  local project="$1" needle="$2"
+  [[ -f "$project/package.json" ]] || return 1
+  grep -Eq "\"${needle}\"[[:space:]]*:" "$project/package.json"
+}
+
+detect_node_framework() {
+  local project="$1"
+  [[ -f "$project/package.json" ]] || { echo "node"; return; }
+
+  if grep -Eq '"astro"[[:space:]]*:' "$project/package.json"; then
+    echo "astro"
+  elif grep -Eq '"vite"[[:space:]]*:' "$project/package.json"; then
+    echo "vite"
+  elif grep -Eq '"react-scripts"[[:space:]]*:' "$project/package.json"; then
+    echo "react-scripts"
+  elif grep -Eq '"next"[[:space:]]*:' "$project/package.json"; then
+    echo "next"
+  else
+    echo "node"
+  fi
+}
+
+detect_node_package_manager() {
+  local project="$1"
+  if [[ -f "$project/pnpm-lock.yaml" ]]; then
+    echo "pnpm"
+  elif [[ -f "$project/yarn.lock" ]]; then
+    echo "yarn"
+  elif [[ -f "$project/bun.lockb" || -f "$project/bun.lock" ]]; then
+    echo "bun"
+  else
+    echo "npm"
+  fi
+}
+
+node_dev_script_name() {
+  local project="$1" framework="$2"
+  if [[ "$framework" == "react-scripts" ]] && grep -Eq '"start"[[:space:]]*:' "$project/package.json"; then
+    echo "start"
+  elif grep -Eq '"dev"[[:space:]]*:' "$project/package.json"; then
+    echo "dev"
+  elif grep -Eq '"start"[[:space:]]*:' "$project/package.json"; then
+    echo "start"
+  else
+    echo "none"
+  fi
+}
+
+node_port_for_alias() {
+  local alias="$1"
+  local span=$((NODE_PORT_MAX - NODE_PORT_MIN + 1))
+  local sum
+  sum="$(printf '%s' "$alias" | cksum | awk '{print $1}')"
+  echo $((NODE_PORT_MIN + (sum % span)))
+}
+
+node_port_in_use() {
+  local port="$1"
+  command -v lsof >/dev/null 2>&1 || return 1
+  lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+node_allocate_port() {
+  local alias="$1" preferred="${2:-}"
+  local port start attempts=0 span=$((NODE_PORT_MAX - NODE_PORT_MIN + 1))
+
+  if [[ -n "$preferred" ]]; then
+    echo "$preferred"
+    return 0
+  fi
+
+  start="$(node_port_for_alias "$alias")"
+  port="$start"
+  while [[ "$attempts" -lt "$span" ]]; do
+    if ! node_port_in_use "$port"; then
+      echo "$port"
+      return 0
+    fi
+    port=$((port + 1))
+    [[ "$port" -le "$NODE_PORT_MAX" ]] || port="$NODE_PORT_MIN"
+    attempts=$((attempts + 1))
+  done
+
+  die "No free Node dev-server port available in ${NODE_PORT_MIN}-${NODE_PORT_MAX}"
+}
+
+node_runtime_pid_file() { echo "$PROCESS_DIR/$1.pid"; }
+node_runtime_log_file() { echo "$PROCESS_DIR/$1.log"; }
+
+node_runtime_pid() {
+  local alias="$1" file
+  file="$(node_runtime_pid_file "$alias")"
+  [[ -f "$file" ]] || return 1
+  cat "$file"
+}
+
+node_runtime_running() {
+  local alias="$1" pid
+  pid="$(node_runtime_pid "$alias" 2>/dev/null || true)"
+  [[ -n "$pid" ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+node_dev_command_array() {
+  local project="$1" framework="$2" manager="$3" script="$4" host="$5" port="$6"
+  case "$manager:$framework" in
+    npm:astro)
+      printf '%s\0' npm run "$script" -- --host "$host" --port "$port"
+      ;;
+    pnpm:astro)
+      printf '%s\0' pnpm "$script" --host "$host" --port "$port"
+      ;;
+    yarn:astro)
+      printf '%s\0' yarn "$script" --host "$host" --port "$port"
+      ;;
+    bun:astro)
+      printf '%s\0' bun run "$script" -- --host "$host" --port "$port"
+      ;;
+    npm:vite)
+      printf '%s\0' npm run "$script" -- --host "$host" --port "$port" --strictPort
+      ;;
+    pnpm:vite)
+      printf '%s\0' pnpm "$script" --host "$host" --port "$port" --strictPort
+      ;;
+    yarn:vite)
+      printf '%s\0' yarn "$script" --host "$host" --port "$port" --strictPort
+      ;;
+    bun:vite)
+      printf '%s\0' bun run "$script" -- --host "$host" --port "$port" --strictPort
+      ;;
+    *)
+      # Generic Node / react-scripts / Next: use conventional HOST/PORT env.
+      # Frameworks that honor these get deterministic ports without modifying
+      # package.json. Explicit dev_command can be added to the manifest later.
+      printf '%s\0' env "HOST=$host" "PORT=$port" BROWSER=none "$manager"
+      case "$manager" in
+        npm) printf '%s\0' run "$script" ;;
+        pnpm|yarn) printf '%s\0' "$script" ;;
+        bun) printf '%s\0' run "$script" ;;
+      esac
+      ;;
+  esac
+}
+
+write_node_proxy_conf() {
+  local alias="$1" port="$2"
+  mkdir -p "$APACHE_PROXY_DIR"
+  local file="$APACHE_PROXY_DIR/${alias}.conf"
+
+  cat > "$file" <<EOF
+# Managed by tembeek-local ${VERSION}
+# Process-backed local project: ${alias}.localhost -> 127.0.0.1:${port}
+
+<VirtualHost *:${HTTP_PORT}>
+    ServerName ${alias}.localhost
+    ProxyRequests Off
+    ProxyPreserveHost On
+    ProxyPass "/" "http://127.0.0.1:${port}/" upgrade=websocket retry=0
+    ProxyPassReverse "/" "http://127.0.0.1:${port}/"
+</VirtualHost>
+
+<VirtualHost *:${HTTPS_PORT}>
+    ServerName ${alias}.localhost
+    SSLEngine on
+    SSLCertificateFile "${TLS_CERT}"
+    SSLCertificateKeyFile "${TLS_KEY}"
+
+    ProxyRequests Off
+    ProxyPreserveHost On
+    ProxyPass "/" "http://127.0.0.1:${port}/" upgrade=websocket retry=0
+    ProxyPassReverse "/" "http://127.0.0.1:${port}/"
+</VirtualHost>
+EOF
+}
+
+remove_node_proxy_conf() {
+  local alias="$1"
+  rm -f "$APACHE_PROXY_DIR/${alias}.conf"
+}
+
+ensure_node_dependencies() {
+  local project="$1" manager="$2"
+  [[ -d "$project/node_modules" ]] && return 0
+
+  bold "Installing Node dependencies..."
+  case "$manager" in
+    npm)  (cd "$project" && npm install) ;;
+    pnpm) (cd "$project" && pnpm install) ;;
+    yarn) (cd "$project" && yarn install) ;;
+    bun)  (cd "$project" && bun install) ;;
+    *) die "Unsupported package manager: $manager" ;;
+  esac
+}
+
+node_project_manifest_port() {
+  local project="$1"
+  yaml_value "$project/.tembeek/local.yaml" "dev_port" 2>/dev/null || true
+}
+
+node_project_start() {
+  local project="$1" alias="$2"
+  local manifest="$project/.tembeek/local.yaml"
+  local framework manager script host port
+  framework="$(yaml_value "$manifest" framework 2>/dev/null || true)"
+  [[ -n "$framework" ]] || framework="$(detect_node_framework "$project")"
+  manager="$(yaml_value "$manifest" package_manager 2>/dev/null || true)"
+  [[ -n "$manager" ]] || manager="$(detect_node_package_manager "$project")"
+  script="$(yaml_value "$manifest" dev_script 2>/dev/null || true)"
+  [[ -n "$script" ]] || script="$(node_dev_script_name "$project" "$framework")"
+  [[ "$script" != "none" ]] || die "No dev/start script found in $project/package.json"
+
+  host="$(yaml_value "$manifest" dev_host 2>/dev/null || true)"
+  [[ -n "$host" ]] || host="127.0.0.1"
+  port="$(node_project_manifest_port "$project")"
+  [[ -n "$port" ]] || port="$(node_allocate_port "$alias")"
+
+  yaml_set "$manifest" framework "$framework"
+  yaml_set "$manifest" package_manager "$manager"
+  yaml_set "$manifest" dev_script "$script"
+  yaml_set "$manifest" dev_host "$host"
+  yaml_set "$manifest" dev_port "$port"
+
+  ensure_node_dependencies "$project" "$manager"
+  write_node_proxy_conf "$alias" "$port"
+
+  if node_runtime_running "$alias"; then
+    ok "Dev server already running: $alias.localhost -> 127.0.0.1:$port"
+    return 0
+  fi
+
+  mkdir -p "$PROCESS_DIR"
+  local log pidfile
+  log="$(node_runtime_log_file "$alias")"
+  pidfile="$(node_runtime_pid_file "$alias")"
+  rm -f "$pidfile"
+
+  local -a cmd=()
+  while IFS= read -r -d '' arg; do cmd+=("$arg"); done < <(
+    node_dev_command_array "$project" "$framework" "$manager" "$script" "$host" "$port"
+  )
+
+  bold "Starting ${framework} dev server..."
+  (
+    cd "$project"
+    nohup "${cmd[@]}" >"$log" 2>&1 &
+    echo $! >"$pidfile"
+  )
+
+  local tries=0
+  while [[ "$tries" -lt 30 ]]; do
+    if curl -fsS --max-time 1 "http://${host}:${port}/" >/dev/null 2>&1; then
+      ok "Dev server ready: 127.0.0.1:$port"
+      return 0
+    fi
+    if ! node_runtime_running "$alias"; then
+      fail "Dev server exited before becoming ready"
+      echo "Log: $log"
+      tail -n 30 "$log" 2>/dev/null | sed 's/^/  /'
+      return 1
+    fi
+    sleep 1
+    tries=$((tries+1))
+  done
+
+  fail "Dev server did not become ready on 127.0.0.1:$port"
+  echo "Log: $log"
+  return 1
+}
+
+node_project_stop() {
+  local alias="$1"
+  local pid
+  pid="$(node_runtime_pid "$alias" 2>/dev/null || true)"
+  if [[ -z "$pid" ]]; then
+    ok "Dev server already stopped: $alias.localhost"
+    return 0
+  fi
+
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    local tries=0
+    while kill -0 "$pid" 2>/dev/null && [[ "$tries" -lt 20 ]]; do
+      sleep 0.1
+      tries=$((tries+1))
+    done
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  rm -f "$(node_runtime_pid_file "$alias")"
+  ok "Dev server stopped: $alias.localhost"
+}
+
 detect_project_type() {
   local project="$1"
-  if [[ -f "$project/composer.json" || -f "$project/index.php" || -d "$project/public" ]]; then
+  if [[ -f "$project/package.json" ]]; then
+    echo "node"
+  elif [[ -f "$project/composer.json" || -f "$project/index.php" || -d "$project/public" ]]; then
     echo "php"
   else
     echo "unknown"
@@ -2789,12 +3194,42 @@ write_manifest() {
   local project="$1" alias="$2" document_root="$3"
   mkdir -p "$project/.tembeek"
 
+  local type
+  type="$(detect_project_type "$project")"
+
   local rel="."
   if [[ "$document_root" != "$project" ]]; then
     rel="${document_root#"$project"/}"
   fi
 
-  cat > "$project/.tembeek/local.yaml" <<EOF
+  if [[ "$type" == "node" ]]; then
+    local framework manager script port
+    framework="$(detect_node_framework "$project")"
+    manager="$(detect_node_package_manager "$project")"
+    script="$(node_dev_script_name "$project" "$framework")"
+    port="$(node_allocate_port "$alias")"
+
+    cat > "$project/.tembeek/local.yaml" <<EOF
+schema_version: 1
+project: $(basename "$project")
+type: node
+framework: $framework
+alias: $alias
+document_root: .
+runtime_mode: process-proxy
+package_manager: $manager
+dev_script: $script
+dev_host: 127.0.0.1
+dev_port: $port
+database_engine: none
+strict_warnings: false
+required_extensions: []
+allowed_symlinks: []
+allowed_process_dependencies: []
+policy_exceptions: []
+EOF
+  else
+    cat > "$project/.tembeek/local.yaml" <<EOF
 schema_version: 1
 project: $(basename "$project")
 type: php
@@ -2810,14 +3245,15 @@ allowed_process_dependencies: []
 policy_exceptions: []
 EOF
 
-  if detect_database_need "$project"; then
-    yaml_set "$project/.tembeek/local.yaml" database_engine mysql
-    yaml_set "$project/.tembeek/local.yaml" database_name "$(default_database_name "$alias")"
-    yaml_set "$project/.tembeek/local.yaml" database_user "$(default_database_user "$alias")"
-    yaml_set "$project/.tembeek/local.yaml" migration_dir "$(detect_migration_dir "$project")"
-    yaml_set "$project/.tembeek/local.yaml" migration_command "$(detect_migration_command "$project")"
-  else
-    yaml_set "$project/.tembeek/local.yaml" database_engine none
+    if detect_database_need "$project"; then
+      yaml_set "$project/.tembeek/local.yaml" database_engine mysql
+      yaml_set "$project/.tembeek/local.yaml" database_name "$(default_database_name "$alias")"
+      yaml_set "$project/.tembeek/local.yaml" database_user "$(default_database_user "$alias")"
+      yaml_set "$project/.tembeek/local.yaml" migration_dir "$(detect_migration_dir "$project")"
+      yaml_set "$project/.tembeek/local.yaml" migration_command "$(detect_migration_command "$project")"
+    else
+      yaml_set "$project/.tembeek/local.yaml" database_engine none
+    fi
   fi
 
   ok "Wrote .tembeek/local.yaml"
@@ -2992,26 +3428,29 @@ cmd_init() {
         [[ $# -gt 0 ]] || die "--alias requires a value"
         alias="$(normalize_alias "$1")"
         ;;
-      *)
-        die "Unknown init option: $1"
-        ;;
+      *) die "Unknown init option: $1" ;;
     esac
     shift
   done
 
-  [[ "$(detect_project_type "$project")" == "php" ]] || die "Project does not look like a PHP project: $project"
+  local type
+  type="$(detect_project_type "$project")"
+  [[ "$type" != "unknown" ]] || die "Project type is not supported: $project"
 
   [[ -n "$alias" ]] || alias="$(infer_alias "$project")"
   validate_alias "$alias"
 
-  local document_root
-  document_root="$(detect_document_root "$project")"
-  [[ -d "$document_root" ]] || die "Detected document root does not exist: $document_root"
+  local document_root="$project"
+  if [[ "$type" == "php" ]]; then
+    document_root="$(detect_document_root "$project")"
+    [[ -d "$document_root" ]] || die "Detected document root does not exist: $document_root"
+  fi
 
-  bold "Initializing Tembeek PHP project"
+  bold "Initializing Tembeek ${type} project"
   echo "Project:       $project"
   echo "Alias:         $alias.localhost"
-  echo "Document root: $document_root"
+  echo "Type:          $type"
+  [[ "$type" == "php" ]] && echo "Document root: $document_root"
   echo
 
   if [[ ! -f "$project/.tembeek/local.yaml" ]]; then
@@ -3020,8 +3459,18 @@ cmd_init() {
     ok "Manifest already exists"
   fi
 
-  ensure_env_file "$project" "$alias"
-  register_alias_target "$alias" "$document_root"
+  if [[ "$type" == "php" ]]; then
+    ensure_env_file "$project" "$alias"
+    register_alias_target "$alias" "$document_root"
+  else
+    ensure_registry
+    # Keep alias presence discoverable for TLS/project tooling; Apache proxy vhost
+    # handles requests, so this symlink is not the serving mechanism.
+    register_alias_target "$alias" "$project"
+    local port
+    port="$(node_project_manifest_port "$project")"
+    write_node_proxy_conf "$alias" "$port"
+  fi
 
   echo
   green "Project initialized"
