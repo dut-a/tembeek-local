@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.9.3
+- Make `make install` idempotent when source and destination are already the same file.
+- Use Bash `-ef` file-identity checks, avoiding macOS/Linux `stat` differences.
+- Skip the copy in that case, reconcile permissions, and still recreate the `tl` symlink.
+- Make `make install-check` report same-file state.
+- Add regression coverage for the macOS/BSD same-file install failure.
+
+
+## 1.9.2
+- Add `make install` for the canonical `tembeek-local` command plus `tl` short form.
+- Install `tl` as a symlink to the canonical executable.
+- Default to `~/.local/bin` with `PREFIX` override support.
+- Refuse to overwrite an unrelated existing `tl`.
+- Add conservative `make uninstall`.
+- Add `make install-check` and `make install-dry-run`.
+- Document installation in README and built-in styled help.
+- Add install/uninstall/collision regression coverage.
+
+
+## 1.9.1
+- Add `project restart <key>` for explicit process recycling while preserving the fixed backend port.
+- Add `project autostart <key> <on|off>` for opt-in global lifecycle integration.
+- Default Node-family manifests to `autostart: false`.
+- Make global `tembeek-local up` start registered process-backed projects with `autostart: true`.
+- Make global `tembeek-local down` stop those autostart projects before shared infrastructure shutdown.
+- Show autostart state in `project status`.
+- Document that ordinary Astro/Vite source changes require no CLI action because HMR/reload is framework-owned.
+- Add lifecycle/autostart regression coverage and Make integration.
+
+
 ## 1.9.0
 - Add first-class Node-family project support alongside PHP projects.
 - Detect Astro, Vite, react-scripts, Next, and generic Node projects from package.json.

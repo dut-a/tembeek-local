@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.9.0"
+VERSION="1.9.3"
 
 LOCALHOST_ROOT="${TEMBEEK_LOCAL_ROOT:-$HOME/Sites/localhost}"
 DEV_ROOT="${TEMBEEK_DEV_ROOT:-$HOME/Development}"
@@ -506,6 +506,12 @@ ${BOLD}PROJECTS${RESET}
   ${CYAN}project down <key>${RESET}
       Stop the project's process-backed dev server.
 
+  ${CYAN}project restart <key>${RESET}
+      Restart a process-backed project while preserving its deterministic backend port.
+
+  ${CYAN}project autostart <key> <on|off>${RESET}
+      Control whether global tembeek-local up/down starts/stops this process-backed project.
+
   ${CYAN}project status <key>${RESET}
       Show project type, stable URL, backend port, proxy state and process log.
 
@@ -627,6 +633,13 @@ ${BOLD}COMMON WORKFLOWS${RESET}
   Subsequent bootstrap/reconciliation:
       tembeek-local project setup rentbook
 
+  Process-backed project lifecycle:
+      tembeek-local project up mysite
+      tembeek-local project restart mysite
+      tembeek-local project autostart mysite on
+      tembeek-local project status mysite
+      tembeek-local project down mysite
+
   Lower-level project commands remain available:
       tembeek-local init ~/Development/tembeek-rent-book --alias rentbook
       tembeek-local db create rentbook
@@ -680,6 +693,21 @@ ${BOLD}REGISTRY RECOVERY${RESET}
     TEMBEEK_PROJECT_ROOTS environment override
       -> PROJECT_ROOTS in machine config
       -> TEMBEEK_DEV_ROOT / ~/Development default${RESET}
+
+${BOLD}INSTALLATION${RESET}
+  From the repository checkout:
+      make install
+      make install-check
+      make install-dry-run
+      make uninstall
+
+  Default commands:
+      tembeek-local
+      tl                    Short executable alias for tembeek-local
+
+  Default destination:
+      ~/.local/bin/tembeek-local
+      ~/.local/bin/tl -> tembeek-local
 
 ${BOLD}HELP & VERSION${RESET}
   tembeek-local help | -h | --help
@@ -2342,6 +2370,64 @@ cmd_project_setup() {
   ok "Project bootstrap complete: $key"
 }
 
+project_manifest_autostart() {
+  local project="$1"
+  local manifest="$project/.tembeek/local.yaml"
+  local value
+  value="$(yaml_value "$manifest" autostart 2>/dev/null || true)"
+  [[ "$value" == "true" ]] && printf 'true\n' || printf 'false\n'
+}
+
+project_autostart_keys() {
+  ensure_projects_file
+  "$(active_php_bin)" -r '
+    $file=$argv[1];
+    $j=json_decode(file_get_contents($file), true);
+    foreach (($j["projects"] ?? []) as $key=>$p) {
+      $path=$p["path"] ?? "";
+      if ($path !== "") echo $key."\t".$path;
+    }
+  ' "$PROJECTS_FILE" | while IFS=$'\t' read -r key project; do
+    [[ -f "$project/.tembeek/local.yaml" ]] || continue
+    [[ "$(yaml_value "$project/.tembeek/local.yaml" type 2>/dev/null || true)" == "node" ]] || continue
+    [[ "$(project_manifest_autostart "$project")" == "true" ]] || continue
+    printf '%s\n' "$key"
+  done
+}
+
+cmd_project_autostart() {
+  local key="${1:-}" value="${2:-}"
+  [[ -n "$key" && -n "$value" ]] || die "Usage: tembeek-local project autostart <key> <on|off>"
+
+  local project
+  projects_json_has "$key" || die "Unknown project '$key'"
+  project="$(projects_json_get "$key" path)"
+  [[ -f "$project/.tembeek/local.yaml" ]] || die "Project manifest not found: $project/.tembeek/local.yaml"
+
+  case "$value" in
+    on|true|yes|1)
+      yaml_set "$project/.tembeek/local.yaml" autostart true
+      ok "Autostart enabled: $key"
+      ;;
+    off|false|no|0)
+      yaml_set "$project/.tembeek/local.yaml" autostart false
+      ok "Autostart disabled: $key"
+      ;;
+    *)
+      die "Usage: tembeek-local project autostart <key> <on|off>"
+      ;;
+  esac
+}
+
+cmd_project_restart() {
+  [[ $# -eq 1 ]] || die "Usage: tembeek-local project restart <key>"
+  local key="$1"
+
+  bold "Restarting project: $key"
+  cmd_project_down "$key"
+  cmd_project_up "$key"
+}
+
 cmd_project_up() {
   [[ $# -eq 1 ]] || die "Usage: tembeek-local project up <key>"
   local key="$1" project alias type
@@ -2392,6 +2478,7 @@ cmd_project_status() {
     manifest="$project/.tembeek/local.yaml"
     port="$(yaml_value "$manifest" dev_port 2>/dev/null || true)"
     echo "Backend: http://127.0.0.1:${port:-unknown}"
+    echo "Autostart: $(project_manifest_autostart "$project")"
     if node_runtime_running "$alias"; then
       ok "Dev server: UP"
     else
@@ -2415,12 +2502,14 @@ cmd_project() {
     setup|bootstrap) cmd_project_setup "$@" ;;
     up|start) cmd_project_up "$@" ;;
     down|stop) cmd_project_down "$@" ;;
+    restart) cmd_project_restart "$@" ;;
     status) cmd_project_status "$@" ;;
+    autostart) cmd_project_autostart "$@" ;;
     list|ls) cmd_project_list "$@" ;;
     discover) cmd_project_discover "$@" ;;
     roots) cmd_project_roots "$@" ;;
     registry) cmd_project_registry "$@" ;;
-    "") die "Usage: tembeek-local project <register|deregister|setup|up|down|status|list|discover|roots|registry> ..." ;;
+    "") die "Usage: tembeek-local project <register|deregister|setup|up|down|restart|status|autostart|list|discover|roots|registry> ..." ;;
     *) die "Unknown project action: $action" ;;
   esac
 }
@@ -2479,8 +2568,18 @@ cmd_up() {
 
   echo
   doctor_network
+
+  local autostart_key autostart_count=0
+  while IFS= read -r autostart_key; do
+    [[ -n "$autostart_key" ]] || continue
+    echo
+    cmd_project_up "$autostart_key"
+    autostart_count=$((autostart_count+1))
+  done < <(project_autostart_keys)
+
   echo
   ok "Tembeek local infrastructure is up"
+  [[ "$autostart_count" -gt 0 ]] && ok "Autostart projects started: $autostart_count"
   echo "Projects: https://<alias>.localhost"
 }
 
@@ -2489,6 +2588,14 @@ cmd_down() {
 
   bold "Tembeek local infrastructure: DOWN"
   echo
+
+  local autostart_key autostart_count=0
+  while IFS= read -r autostart_key; do
+    [[ -n "$autostart_key" ]] || continue
+    cmd_project_down "$autostart_key"
+    autostart_count=$((autostart_count+1))
+  done < <(project_autostart_keys)
+  [[ "$autostart_count" -gt 0 ]] && echo
 
   if network_forwarder_is_loaded; then
     printf "Stopping the privileged :80/:443 forwarder may request your macOS administrator password.\n"
@@ -3221,6 +3328,7 @@ package_manager: $manager
 dev_script: $script
 dev_host: 127.0.0.1
 dev_port: $port
+autostart: false
 database_engine: none
 strict_warnings: false
 required_extensions: []

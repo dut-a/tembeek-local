@@ -2555,3 +2555,101 @@ The dev server remains loopback-only; Apache provides the trusted HTTPS front do
 
 Generated process state and proxy configuration live under the machine config directory,
 not inside the project repository.
+
+### Restart and autostart
+
+For ordinary Astro/Vite source changes, no CLI action is required. The framework dev
+server remains running and handles HMR/full reload itself.
+
+Use an explicit restart only when the dev-server process genuinely needs recycling:
+
+```bash
+tembeek-local project restart mysite
+```
+
+The restart keeps the same persisted `dev_port`, so the browser URL and Apache proxy
+remain unchanged.
+
+Process-backed projects can opt into global workstation lifecycle:
+
+```bash
+tembeek-local project autostart mysite on
+tembeek-local project autostart mysite off
+```
+
+This stores `autostart: true|false` in the committed project manifest.
+
+When enabled:
+
+```text
+tembeek-local up
+    -> start shared Apache/network/MySQL infrastructure
+    -> start registered process-backed projects with autostart: true
+
+tembeek-local down
+    -> stop autostart process-backed projects
+    -> stop shared infrastructure
+```
+
+`autostart` defaults to `false`, so registering a Node-family project never silently
+adds a background dev server to the global workstation lifecycle.
+
+## Installation
+
+Install the canonical command and its short terminal form:
+
+```bash
+make install
+```
+
+Default layout:
+
+```text
+~/.local/bin/tembeek-local
+~/.local/bin/tl -> tembeek-local
+```
+
+Both names run the exact same executable:
+
+```bash
+tembeek-local project status mysite
+tl project status mysite
+```
+
+`tembeek-local` remains canonical in documentation, diagnostics, configuration, and scripts.
+`tl` is only an ergonomic command alias implemented as a filesystem symlink.
+
+Before installation:
+
+```bash
+make install-check
+make install-dry-run
+```
+
+The installer refuses to overwrite an unrelated existing `tl`.
+
+To choose another prefix:
+
+```bash
+make install PREFIX=/usr/local
+```
+
+To remove the installation:
+
+```bash
+make uninstall
+```
+
+Uninstall is conservative: it removes `tl` only when the symlink still points to
+`tembeek-local`, and removes the canonical executable only when it matches the current
+checkout.
+
+If `~/.local/bin` is not in your `PATH`, add it to your shell configuration.
+
+
+### Idempotent reinstall
+
+`make install` is safe to run repeatedly. If `bin/tembeek-local` and the destination
+`~/.local/bin/tembeek-local` already resolve to the same file, the installer skips the
+copy that macOS/BSD `install` rejects, reconciles executable permissions, and still
+recreates `tl -> tembeek-local`.

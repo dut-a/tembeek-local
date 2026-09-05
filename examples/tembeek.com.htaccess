@@ -1,0 +1,129 @@
+DirectoryIndex index.php
+Options -Indexes -MultiViews
+ErrorDocument 404 /404
+
+<FilesMatch "^(README|DEPLOYMENT|MENU-PUBLISHING-DEPLOYMENT)\.md$|^(composer(?:\.lock|\.json)|phpunit\.xml(?:\.dist)?)$">
+  <IfModule mod_authz_core.c>
+    Require all denied
+  </IfModule>
+  <IfModule !mod_authz_core.c>
+    Order allow,deny
+    Deny from all
+  </IfModule>
+</FilesMatch>
+
+<Files ".maintenance-state.json">
+  <IfModule mod_authz_core.c>
+    Require all denied
+  </IfModule>
+  <IfModule !mod_authz_core.c>
+    Order allow,deny
+    Deny from all
+  </IfModule>
+</Files>
+
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+
+  # Deny internal documentation and deployment tooling. Rewrite-level rules
+  # are used in addition to FilesMatch for shared hosts with partial support
+  # for per-directory authorization directives.
+  RewriteRule ^README[.]md$ - [F,L,NC]
+  RewriteRule ^DEPLOYMENT[.]md$ - [F,L,NC]
+  RewriteRule ^MENU-PUBLISHING-DEPLOYMENT[.]md$ - [F,L,NC]
+  RewriteRule ^scripts(?:/|$) - [F,L,NC]
+  RewriteRule ^tests(?:/|$) - [F,L,NC]
+  RewriteRule ^composer(?:[.]json|[.]lock)$ - [F,L,NC]
+  RewriteRule ^phpunit[.]xml$ - [F,L,NC]
+  RewriteRule ^phpunit[.]xml(?:\.dist)?$ - [F,L,NC]
+  RewriteRule ^includes(?:/|$) - [F,L,NC]
+  RewriteRule ^[.]maintenance-state[.]json$ - [F,L,NC]
+
+  # Environment-aware canonical origin / HTTPS policy.
+  #
+  # LOCAL: preserve *.localhost and only upgrade HTTP -> HTTPS.
+  # PROD: tembeek.com is canonical and HTTPS is mandatory.
+  #
+  # Never use a negative "not tembeek.com" condition here: it captures
+  # *.localhost and redirects local development traffic to production.
+
+  RewriteCond %{HTTP_HOST} \.localhost(?::[0-9]+)?$ [NC]
+  RewriteCond %{HTTPS} !=on
+  RewriteCond %{HTTP:X-Forwarded-Proto} !^https$ [NC]
+  RewriteRule ^ https://%{HTTP_HOST}%{REQUEST_URI} [R=302,L,NE]
+
+  RewriteCond %{HTTP_HOST} ^www\.tembeek\.com$ [NC]
+  RewriteRule ^ https://tembeek.com%{REQUEST_URI} [R=301,L,NE]
+
+  RewriteCond %{HTTP_HOST} ^tembeek\.com$ [NC]
+  RewriteCond %{HTTPS} !=on
+  RewriteCond %{HTTP:X-Forwarded-Proto} !^https$ [NC]
+  RewriteRule ^ https://tembeek.com%{REQUEST_URI} [R=301,L,NE]
+
+  # Serve release-fingerprinted CSS and JavaScript paths from their stable
+  # physical files. Path fingerprints remain distinct even when an upstream
+  # cache is configured to ignore query strings.
+  RewriteRule ^assets/(css|js)/(.+)[.]v[0-9-]+[.](css|js)$ assets/$1/$2.$3 [L,NC]
+
+  # Canonicalize explicit index.php requests, including /c/dut/index.php.
+  RewriteCond %{THE_REQUEST} \s/+(.*/)?index\.php[?\s] [NC]
+  RewriteRule ^(.*/)?index\.php$ /$1 [R=301,L,NE]
+
+  # Redirect public .php URLs to their extensionless equivalent.
+  RewriteCond %{THE_REQUEST} \s/+(.+?)\.php[?\s] [NC]
+  RewriteRule ^(.+?)\.php$ /$1 [R=301,L,NE]
+
+  # Remove a trailing slash from clean page URLs, but preserve real directories.
+  RewriteCond %{REQUEST_FILENAME} !-d
+  RewriteRule ^(.+)/$ /$1 [R=301,L,NE]
+
+  # When Lead Desk enables maintenance, internally serve the self-contained
+  # 503 page while preserving administrator, QR contact and AutoSSL access.
+  RewriteCond %{DOCUMENT_ROOT}/.maintenance-state.json -f
+  RewriteCond %{REQUEST_URI} !^/maintenance(?:[.]php)?/?$ [NC]
+  RewriteCond %{REQUEST_URI} !^/admin(?:/|$) [NC]
+  RewriteCond %{REQUEST_URI} !^/api/menu-publish(?:[.]php)?/?$ [NC]
+  RewriteCond %{REQUEST_URI} !^/c/dut(?:/|$) [NC]
+  RewriteCond %{REQUEST_URI} !^/assets(?:/|$) [NC]
+  RewriteCond %{REQUEST_URI} !^/[.]well-known(?:/|$) [NC]
+  RewriteRule ^ maintenance.php [END]
+
+  # Internally serve an existing PHP file for an extensionless request.
+  RewriteCond %{REQUEST_FILENAME} !-f
+  RewriteCond %{REQUEST_FILENAME} !-d
+  RewriteCond %{REQUEST_FILENAME}.php -f
+  RewriteRule ^(.+?)/?$ $1.php [L]
+</IfModule>
+
+<IfModule mod_headers.c>
+  Header set X-Content-Type-Options "nosniff"
+  Header always set X-Frame-Options "DENY"
+  Header always set X-XSS-Protection "0"
+  Header always set X-Permitted-Cross-Domain-Policies "none"
+  Header set Referrer-Policy "strict-origin-when-cross-origin"
+  Header set Permissions-Policy "browsing-topics=(), camera=(), geolocation=(), microphone=(), payment=(), usb=()"
+  Header always set Cross-Origin-Opener-Policy "same-origin"
+  Header always set Cross-Origin-Resource-Policy "same-origin"
+  Header always set Strict-Transport-Security "max-age=15552000"
+
+  # PHP generates public pages, forms, administration and API responses.
+  # Never allow a shared edge cache to retain those responses across releases.
+  <FilesMatch "[.]php$">
+    Header always set Cache-Control "no-cache, no-store, max-age=0, must-revalidate"
+    Header always set CDN-Cache-Control "no-store"
+    Header always set Cloudflare-CDN-Cache-Control "no-store"
+    Header always set Expires "Thu, 01 Jan 1970 00:00:00 GMT"
+  </FilesMatch>
+</IfModule>
+
+<IfModule mod_expires.c>
+  ExpiresActive On
+  ExpiresByType text/css "access plus 7 days"
+  ExpiresByType application/javascript "access plus 7 days"
+  ExpiresByType font/woff2 "access plus 1 year"
+  ExpiresByType application/pdf "access plus 7 days"
+</IfModule>
+
+<IfModule mod_mime.c>
+  AddType font/woff2 .woff2
+</IfModule>
