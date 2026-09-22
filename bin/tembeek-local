@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="1.9.5"
+VERSION="1.10.0"
 
 LOCALHOST_ROOT="${TEMBEEK_LOCAL_ROOT:-$HOME/Sites/localhost}"
 DEV_ROOT="${TEMBEEK_DEV_ROOT:-$HOME/Development}"
@@ -505,6 +505,9 @@ ${BOLD}PROJECTS${RESET}
 
   ${CYAN}project down <key>${RESET}
       Stop the project's process-backed dev server.
+
+  ${CYAN}project rescan <key> [--restart]${RESET}
+      Refresh detected Node framework, package manager and dev script; optionally restart.
 
   ${CYAN}project restart <key>${RESET}
       Restart a process-backed project while preserving its deterministic backend port.
@@ -2422,6 +2425,42 @@ cmd_project_autostart() {
   esac
 }
 
+cmd_project_rescan() {
+  [[ $# -ge 1 && $# -le 2 ]] || die "Usage: tembeek-local project rescan <key> [--restart]"
+  local key="$1" restart="${2:-}" project manifest framework manager script
+  [[ -z "$restart" || "$restart" == "--restart" ]] || die "Usage: tembeek-local project rescan <key> [--restart]"
+  projects_json_has "$key" || die "Unknown project '$key'"
+  project="$(projects_json_get "$key" path)"
+  manifest="$project/.tembeek/local.yaml"
+  [[ -f "$manifest" ]] || die "Project manifest not found: $manifest; run project setup first"
+  [[ "$(detect_project_type "$project")" == "node" ]] || die "Project rescan currently supports Node-family projects only"
+  [[ "$(yaml_value "$manifest" type)" == "node" ]] || die "Project type changed; rescan cannot migrate serving modes"
+
+  framework="$(detect_node_framework "$project")"
+  manager="$(detect_node_package_manager "$project")"
+  script="$(node_dev_script_name "$project" "$framework")"
+  [[ "$script" != "none" ]] || die "No dev/start script found in $project/package.json; manifest unchanged"
+
+  bold "Rescanning project: $key"
+  local field value previous
+  for field in framework package_manager dev_script; do
+    case "$field" in
+      framework) value="$framework" ;;
+      package_manager) value="$manager" ;;
+      dev_script) value="$script" ;;
+    esac
+    previous="$(yaml_value "$manifest" "$field" 2>/dev/null || true)"
+    yaml_set "$manifest" "$field" "$value"
+    echo "$field: ${previous:-unset} -> $value"
+  done
+  ok "Refreshed .tembeek/local.yaml"
+  if [[ "$restart" == "--restart" ]]; then
+    cmd_project_restart "$key"
+  else
+    echo "Apply to the dev server with: tembeek-local project restart $key"
+  fi
+}
+
 cmd_project_restart() {
   [[ $# -eq 1 ]] || die "Usage: tembeek-local project restart <key>"
   local key="$1"
@@ -2505,6 +2544,7 @@ cmd_project() {
     setup|bootstrap) cmd_project_setup "$@" ;;
     up|start) cmd_project_up "$@" ;;
     down|stop) cmd_project_down "$@" ;;
+    rescan) cmd_project_rescan "$@" ;;
     restart) cmd_project_restart "$@" ;;
     status) cmd_project_status "$@" ;;
     autostart) cmd_project_autostart "$@" ;;
@@ -2512,7 +2552,7 @@ cmd_project() {
     discover) cmd_project_discover "$@" ;;
     roots) cmd_project_roots "$@" ;;
     registry) cmd_project_registry "$@" ;;
-    "") die "Usage: tembeek-local project <register|deregister|setup|up|down|restart|status|autostart|list|discover|roots|registry> ..." ;;
+    "") die "Usage: tembeek-local project <register|deregister|setup|up|down|rescan|restart|status|autostart|list|discover|roots|registry> ..." ;;
     *) die "Unknown project action: $action" ;;
   esac
 }

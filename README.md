@@ -1740,7 +1740,7 @@ tembeek-local version
 Current:
 
 ```text
-1.0.0
+1.10.0
 ```
 
 Manifest version:
@@ -2555,6 +2555,30 @@ The dev server remains loopback-only; Apache provides the trusted HTTPS front do
 
 Generated process state and proxy configuration live under the machine config directory,
 not inside the project repository.
+
+### Rescan project settings
+
+After changing a Node project's package manager, framework, or dev/start script, run:
+
+```bash
+tembeek-local project rescan mysite
+# Refresh settings and restart the dev server immediately:
+tembeek-local project rescan mysite --restart
+```
+
+Rescan updates `framework`, `package_manager`, and `dev_script` in
+`.tembeek/local.yaml`, including any manual overrides of those three fields.
+It preserves other settings, including the alias, backend port, and autostart.
+Without `--restart`, the running server is unaffected until its next restart.
+
+Package manager detection uses lockfiles in this order: `pnpm-lock.yaml`,
+`yarn.lock`, `bun.lockb`/`bun.lock`, then npm as the fallback. For an npm-to-pnpm
+switch, ensure `pnpm-lock.yaml` exists before rescanning. Detection does not read
+`package.json`'s `packageManager` field. Rescan does not reinstall existing
+`node_modules`; install dependencies with the new manager as part of the switch.
+
+Rescan requires an initialized Node-family project and a dev/start script.
+PHP projects and migrations between serving modes are not supported.
 
 ### Restart and autostart
 

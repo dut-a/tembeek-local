@@ -1,6 +1,6 @@
 # Local Development Tool — Future Features TODO
 
-> This roadmap captures deferred work after `tembeek-local v1.9.5`.
+> This roadmap captures deferred work after `tembeek-local v1.10.0`.
 > **Migration to `dut-tools` is the next architectural boundary and must happen before database-engine or web-server expansion.**
 > The current `tembeek-local` name/config namespace remains a compatibility surface during that migration.
 

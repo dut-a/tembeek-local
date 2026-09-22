@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.10.0
+- Add `project rescan <key> [--restart]` to refresh detected Node framework, package manager, and dev script while preserving other manifest settings.
+
+
 ## 1.9.5
 - Scope `tl` collision protection to the actual destination path instead of any `tl` found in PATH.
 - Allow isolated/test-prefix installs even when the user's normal shell already has a legitimate `tl`.
